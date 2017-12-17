@@ -6,7 +6,8 @@
   {modules, []},
   {mod, {grailbag_app, []}},
   {env, [
-    {log_handlers, []},
-    {listen, [{localhost, 3255}]}
+    %{data_dir, "..."}            % `file:filename()'
+    {log_handlers, []},           % list of `{Module, Args}'
+    {listen, [{localhost, 3255}]} % list of `{Address, Port}'
   ]}
 ]}.

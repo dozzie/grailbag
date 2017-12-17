@@ -1,18 +1,31 @@
 %%%---------------------------------------------------------------------------
 %%% @private
 %%% @doc
+%%%   Supervisor for artifact handles.
 %%% @end
 %%%---------------------------------------------------------------------------
 
--module(grailbag_sup).
+-module(grailbag_artifact_sup).
 
 -behaviour(supervisor).
+
+%% public interface
+-export([spawn_worker/5]).
 
 %% supervision tree API
 -export([start_link/0]).
 
 %% supervisor callbacks
 -export([init/1]).
+
+%%%---------------------------------------------------------------------------
+%%% public interface
+%%%---------------------------------------------------------------------------
+
+%% @doc Spawn a new worker process.
+
+spawn_worker(Owner, ID, Path, Type, Tags) ->
+  supervisor:start_child(?MODULE, [Owner, ID, Path, Type, Tags]).
 
 %%%---------------------------------------------------------------------------
 %%% supervision tree API
@@ -32,15 +45,10 @@ start_link() ->
 %% @doc Initialize supervisor.
 
 init([] = _Args) ->
-  {ok, LogHandlers} = application:get_env(log_handlers),
-  Strategy = {one_for_one, 5, 10},
+  Strategy = {simple_one_for_one, 5, 10},
   Children = [
-    {grailbag_log, {grailbag_log, start_link, [LogHandlers]},
-      permanent, 5000, worker, [grailbag_log]},
-    {grailbag_artifact_sup, {grailbag_artifact_sup, start_link, []},
-      permanent, 5000, supervisor, [grailbag_artifact_sup]},
-    {grailbag_tcp_sup, {grailbag_tcp_sup, start_link, []},
-      permanent, 5000, supervisor, [grailbag_tcp_sup]}
+    {undefined, {grailbag_artifact, start_link, []},
+      temporary, 1000, worker, [grailbag_artifact]}
   ],
   {ok, {Strategy, Children}}.
 
