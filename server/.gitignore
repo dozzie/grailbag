@@ -1,0 +1,9 @@
+*.beam
+*.plt
+/ebin/*.app
+/.erlang.mk
+/grailbag.d
+/doc/edoc-info
+/doc/*.png
+/doc/*.html
+/doc/*.css

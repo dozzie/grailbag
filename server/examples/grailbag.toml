@@ -1,0 +1,31 @@
+#
+# Example config file for GrailBag server.
+#
+
+#-----------------------------------------------------------------------------
+# daemon configuration
+
+[network]
+#listen = ["*:3255"]
+
+[storage]
+data_dir = "/var/lib/grailbag"
+#hash = "sha1" # TODO: support for anything else
+#oplog_size = ... # bytes? number of operations?
+
+#-----------------------------------------------------------------------------
+# known artifacts and their schemas
+
+[artifact.kernel]
+unique_tags = ["build_version"]
+mandatory_tags = ["build_version", "upstream_version"]
+#parts = ["vmlinuz", "modules.tar.gz"] # TODO: plans for the future
+tokens = ["testing", "default"]
+#autodelete = { days = 30, count = 20 } # TODO: plans for the future
+
+[artifact.rootfs]
+unique_tags = ["version"]
+mandatory_tags = ["version", "arch", "os_release"]
+
+#-----------------------------------------------------------------------------
+# vim:ft=dosini

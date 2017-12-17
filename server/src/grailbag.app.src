@@ -1,0 +1,9 @@
+{application, grailbag, [
+  {description, "artifact repository"},
+  {vsn, "0.0.0"},
+  {registered, []},
+  {applications, [kernel, stdlib, crypto]},
+  {modules, []},
+  %{mod, {grailbag_app, []}},
+  {env, []}
+]}.
