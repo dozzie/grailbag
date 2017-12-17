@@ -37,9 +37,21 @@
 %%%---------------------------------------------------------------------------
 %%% types {{{
 
+-include_lib("kernel/include/file.hrl").
+
 -type read_handle() :: tuple().
 
 -type write_handle() :: pid().
+
+-record(artifact, {
+  fh   :: file:fd(),
+  id   :: grailbag:artifact_id(),
+  type :: grailbag:artifact_type(),
+  body_hash :: grailbag:body_hash(),
+  body_size :: non_neg_integer(),
+  tags   :: [{grailbag:tag(), grailbag:tag_value()}],
+  tokens :: [grailbag:token()]
+}).
 
 -record(state, {
   owner :: {pid(), reference()},
@@ -104,6 +116,19 @@ try_create(DataDir, Tries) ->
 
 %% }}}
 %%----------------------------------------------------------
+%% artifact_dir() {{{
+
+%% @doc Determine path of artifact's data directory.
+
+-spec artifact_dir(grailbag:artifact_id()) ->
+  file:filename().
+
+artifact_dir(ID) ->
+  {ok, DataDir} = application:get_env(grailbag, data_dir),
+  filename:join(DataDir, binary_to_list(ID)).
+
+%% }}}
+%%----------------------------------------------------------
 
 %% @doc Append data to artifact's body.
 
@@ -130,8 +155,8 @@ finish(Handle) ->
   when Reason :: {schema, Dup :: [grailbag:tag()], Missing :: [grailbag:tag()]}
                | term().
 
-update_tags(_ID, _Set, _Unset) ->
-  {ok, _DataDir} = application:get_env(grailbag, data_dir),
+update_tags(ID, _Set, _Unset) ->
+  _Path = artifact_dir(ID),
   'TODO'.
 
 %% @doc Add and/or remove tokens to/from specified artifact.
@@ -146,43 +171,83 @@ update_tags(_ID, _Set, _Unset) ->
   when Reason :: {schema, Unknown :: [grailbag:token()]}
                | term().
 
-update_tokens(_ID, _Set, _Unset) ->
-  {ok, _DataDir} = application:get_env(grailbag, data_dir),
+update_tokens(ID, _Set, _Unset) ->
+  _Path = artifact_dir(ID),
   'TODO'.
 
 %% @doc Open an artifact for reading its body.
 
 -spec open(grailbag:artifact_id()) ->
-  {ok, read_handle()} | {error, term()}.
+  {ok, read_handle()} | {error, Reason}
+  when Reason :: {body, file:posix()}
+               | {metadata, format | file:posix()}.
 
-open(_ID) ->
-  {ok, _DataDir} = application:get_env(grailbag, data_dir),
-  'TODO'.
+open(ID) ->
+  Path = artifact_dir(ID),
+  case file:open(filename:join(Path, ?BODY_FILE), [raw, read, binary]) of
+    {ok, FH} ->
+      case decode_info_file(filename:join(Path, ?METADATA_FILE)) of
+        {ok, ID, Type, BodyHash, Tags, Tokens} ->
+          {ok, BodySize} = file:position(FH, eof),
+          {ok, 0} = file:position(FH, bof),
+          Handle = #artifact{
+            fh = FH,
+            id = ID,
+            type = Type,
+            body_hash = BodyHash,
+            body_size = BodySize,
+            tags = Tags,
+            tokens = Tokens
+          },
+          {ok, Handle};
+        {error, badarg} ->
+          file:close(FH),
+          {error, {metadata, format}};
+        {error, Reason} ->
+          file:close(FH),
+          {error, {metadata, Reason}}
+      end;
+    {error, Reason} ->
+      {error, {body, Reason}}
+  end.
 
 %% @doc Read a chunk of artifact's body.
 
 -spec read(read_handle(), pos_integer()) ->
-  {ok, binary()} | eof | {error, term()}.
+  {ok, binary()} | eof | {error, badarg | file:posix()}.
 
-read(_ID, _Size) ->
-  'TODO'.
+read(_Handle = #artifact{fh = FH}, Size) ->
+  file:read(FH, Size).
 
 %% @doc Read artifact's metadata.
 %%
 %% @todo Upload time.
 
 -spec info(Object :: grailbag:artifact_id() | read_handle()) ->
-  {ok, FileSize, BodyHash, Tags, Tokens} | undefined
-  when FileSize :: non_neg_integer(),
+  {ok, Type, FileSize, BodyHash, Tags, Tokens} | undefined
+  when Type :: grailbag:artifact_type(),
+       FileSize :: non_neg_integer(),
        BodyHash :: grailbag:body_hash(),
        Tags :: [{grailbag:tag(), grailbag:tag_value()}],
        Tokens :: [grailbag:token()].
 
 info(ID) when is_binary(ID) ->
-  {ok, _DataDir} = application:get_env(grailbag, data_dir),
-  'TODO';
-info(Handle) when is_tuple(Handle) ->
-  'TODO'.
+  Path = artifact_dir(ID),
+  case file:read_file_info(filename:join(Path, ?BODY_FILE)) of
+    {ok, #file_info{size = BodySize}} ->
+      case decode_info_file(filename:join(Path, ?METADATA_FILE)) of
+        {ok, _ID, Type, BodyHash, Tags, Tokens} ->
+          {ok, Type, BodySize, BodyHash, Tags, Tokens};
+        {error, _} ->
+          undefined
+      end;
+    {error, _} ->
+      undefined
+  end;
+info(_Handle = #artifact{type = Type, body_size = BodySize,
+                         body_hash = BodyHash, tags = Tags,
+                         tokens = Tokens}) ->
+  {ok, Type, BodySize, BodyHash, Tags, Tokens}.
 
 %% @doc Close descriptors used for reading or writing an artifact.
 
@@ -195,8 +260,9 @@ close(Handle) when is_pid(Handle) ->
   catch
     _:_ -> ok
   end;
-close(Handle) when is_tuple(Handle) ->
-  'TODO'.
+close(_Handle = #artifact{fh = FH}) ->
+  file:close(FH),
+  ok.
 
 %% @doc Delete an artifact.
 
@@ -204,8 +270,7 @@ close(Handle) when is_tuple(Handle) ->
   ok | {error, file:posix()}.
 
 delete(ID) ->
-  {ok, DataDir} = application:get_env(grailbag, data_dir),
-  Path = filename:join(DataDir, binary_to_list(ID)),
+  Path = artifact_dir(ID),
   file:delete(filename:join(Path, ?BODY_FILE)),
   file:delete(filename:join(Path, ?METADATA_FILE)),
   file:delete(filename:join(Path, ?METADATA_UPDATE_FILE)),
@@ -389,6 +454,8 @@ hash_final(Context) ->
 %%% encoding/decoding artifact metadata
 
 %% @doc Encode metadata for writing to artifact's info file.
+%%
+%% @see decode_info/1
 
 -spec encode_info(grailbag:artifact_id(), grailbag:artifact_type(),
                   grailbag:body_hash(),
@@ -430,6 +497,71 @@ encode_tag(Tag, Value) ->
 
 encode_token(Token) ->
   [<<(size(Token)):16>>, Token].
+
+%% @doc Decode metadata from artifact's info file.
+%%
+%% @see decode_info/1
+%% @see encode_info/5
+
+-spec decode_info_file(file:filename()) ->
+    {ok, grailbag:artifact_id(), grailbag:artifact_type(),
+      grailbag:body_hash(), [{grailbag:tag(), grailbag:tag_value()}],
+      [grailbag:token()]}
+  | {error, badarg | file:posix()}.
+
+decode_info_file(File) ->
+  % the file, even accounting for tags, should be small, especially that all
+  % the information is supposed to also be kept in ETS table
+  case file:read_file(File) of
+    {ok, Data} -> decode_info(Data);
+    {error, Reason} -> {error, Reason}
+  end.
+
+%% @doc Decode metadata from content of artifact's info file.
+%%
+%% @see decode_info_file/1
+%% @see encode_info/5
+
+-spec decode_info(binary()) ->
+    {ok, grailbag:artifact_id(), grailbag:artifact_type(),
+      grailbag:body_hash(), [{grailbag:tag(), grailbag:tag_value()}],
+      [grailbag:token()]}
+  | {error, badarg}.
+
+decode_info(Data) ->
+  case Data of
+    <<UUID:16/binary, TypeLen:16, Type:TypeLen/binary,
+      HashLen:16, Hash:HashLen/binary, NTags:32, NTokens:32,
+      TagsTokensData/binary>> ->
+      ID = list_to_binary(grailbag_uuid:format(UUID)),
+      try
+        {Tags, TokensData} = decode_tags(NTags, [], TagsTokensData),
+        {Tokens, <<>>} = decode_tokens(NTokens, [], TokensData),
+        {ok, ID, binary:copy(Type), binary:copy(Hash), Tags, Tokens}
+      catch
+        _:_ ->
+          {error, badarg}
+      end;
+    _ ->
+      {error, badarg}
+  end.
+
+%% @doc Decode specified number of tags and their values from binary data.
+
+decode_tags(0 = _NTags, Tags, Data) ->
+  {lists:reverse(Tags), Data};
+decode_tags(NTags, Tags,
+            <<TagSize:16, ValueSize:32, Tag:TagSize/binary,
+              Value:ValueSize/binary, Rest/binary>> = _Data) ->
+  decode_tags(NTags - 1, [{binary:copy(Tag), binary:copy(Value)} | Tags], Rest).
+
+%% @doc Decode specified number of token names from binary data.
+
+decode_tokens(0 = _NTokens, Tokens, Data) ->
+  {lists:reverse(Tokens), Data};
+decode_tokens(NTokens, Tokens,
+              <<TokenSize:16, Token:TokenSize/binary, Rest/binary>> = _Data) ->
+  decode_tokens(NTokens - 1, [binary:copy(Token) | Tokens], Rest).
 
 %%%---------------------------------------------------------------------------
 %%% vim:ft=erlang:foldmethod=marker
