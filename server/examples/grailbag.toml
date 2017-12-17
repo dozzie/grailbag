@@ -3,17 +3,6 @@
 #
 
 #-----------------------------------------------------------------------------
-# daemon configuration
-
-[network]
-#listen = ["*:3255"]
-
-[storage]
-data_dir = "/var/lib/grailbag"
-#hash = "sha1" # TODO: support for anything else
-#oplog_size = ... # bytes? number of operations?
-
-#-----------------------------------------------------------------------------
 # known artifacts and their schemas
 
 [artifact.kernel]
@@ -26,6 +15,36 @@ tokens = ["testing", "default"]
 [artifact.rootfs]
 unique_tags = ["version"]
 mandatory_tags = ["version", "arch", "os_release"]
+
+#-----------------------------------------------------------------------------
+# daemon configuration
+
+[network]
+#listen = ["localhost:3255"]
+
+[storage]
+data_dir = "/var/lib/grailbag"
+#hash = "sha1" # TODO: support for anything else
+#oplog_size = ... # bytes? number of operations?
+
+#-----------------------------------------------------------------------------
+# Erlang configuration
+
+[erlang]
+
+# name of Erlang node in distributed mode (<node_name>@<hostname>)
+node_name = "grailbag"
+# type of hostnames in distributed mode ("longnames" or "shortnames", as
+# net_kernel documentation says)
+name_type = "longnames"
+# text file with magic cookie to use in distributed Erlang
+cookie_file = "/etc/grailbag/cookie.txt"
+# start distributed Erlang immediately or on command-line request
+# ("grailbagd dist-erl-start")
+distributed_immediate = false
+
+# file with Erlang system events log
+#log_file = "/var/log/grailbag/erlang.log"
 
 #-----------------------------------------------------------------------------
 # vim:ft=dosini

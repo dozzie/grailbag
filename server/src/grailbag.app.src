@@ -4,6 +4,9 @@
   {registered, []},
   {applications, [kernel, stdlib, crypto]},
   {modules, []},
-  %{mod, {grailbag_app, []}},
-  {env, []}
+  {mod, {grailbag_app, []}},
+  {env, [
+    {log_handlers, []},
+    {listen, [{localhost, 3255}]}
+  ]}
 ]}.
