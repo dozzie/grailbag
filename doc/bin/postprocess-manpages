@@ -1,0 +1,38 @@
+#!/bin/sh
+#
+# Fix some formatting that Sphinx got wrong.
+#
+
+indent_code_blocks() {
+  awk '
+    $1 == ".SH" {sect = $2}
+    $0 == ".ft P" {indent = 0}
+    indent {$0 = "  " $0}
+    # all code blocks except in SYNOPSIS section
+    $0 == ".ft C" && sect != "SYNOPSIS" {indent = 1}
+    {print}
+  '
+}
+
+fix_manpage_references() {
+  # \fIfoo(1)\fR => \fIfoo\fR\|(1)
+  sed 's/\\fI\([^ ]*\)\(([1-8])\)\\fP/\\fI\1\\fR\\|\2/g'
+}
+
+fix_double_quotes_listing() {
+  # double quotes in .TP<nl>.B -> \(dq
+  awk '
+    $1 == ".TP" { list = 1 }
+    $1 == ".B" && list { gsub(/"/, "\\(dq") }
+    $1 != ".TP" { list = 0 }
+    {print}
+  '
+}
+
+for FILE in "$@"; do
+  cat "$FILE" | \
+    indent_code_blocks | \
+    fix_manpage_references | \
+    fix_double_quotes_listing > "$FILE.tmp"
+  mv -- "$FILE.tmp" "$FILE"
+done
