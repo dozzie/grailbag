@@ -76,6 +76,10 @@
 %%%---------------------------------------------------------------------------
 
 %% @doc Create a new handle for artifact that is being uploaded.
+%%
+%% @see write/2
+%% @see finish/1
+%% @see close/1
 
 -spec create(grailbag:artifact_type(),
              [{grailbag:tag(), grailbag:tag_value()}]) ->
@@ -133,6 +137,10 @@ artifact_dir(ID) ->
 %%----------------------------------------------------------
 
 %% @doc Append data to artifact's body.
+%%
+%% @see create/2
+%% @see finish/1
+%% @see close/1
 
 -spec write(write_handle(), binary()) ->
   ok | {error, file:posix()}.
@@ -141,6 +149,10 @@ write(Handle, Data) ->
   gen_server:call(Handle, {write, Data}, infinity).
 
 %% @doc Finalize artifact's body, marking the artifact as complete.
+%%
+%% @see create/2
+%% @see write/2
+%% @see close/1
 
 -spec finish(write_handle()) ->
   {ok, grailbag:body_hash()} | {error, file:posix()}.
@@ -216,6 +228,10 @@ update_tokens(ID, Tokens) ->
   end.
 
 %% @doc Open an artifact for reading its body.
+%%
+%% @see read/2
+%% @see info/1
+%% @see close/1
 
 -spec open(grailbag:artifact_id()) ->
   {ok, read_handle()} | {error, Reason}
@@ -252,6 +268,9 @@ open(ID) ->
   end.
 
 %% @doc Read a chunk of artifact's body.
+%%
+%% @see open/1
+%% @see close/1
 
 -spec read(read_handle(), pos_integer()) ->
   {ok, binary()} | eof | {error, badarg | file:posix()}.
@@ -262,6 +281,8 @@ read(_Handle = #artifact{fh = FH}, Size) ->
 %% @doc Read artifact's metadata.
 %%
 %% @todo Upload time.
+%%
+%% @see open/1
 
 -spec info(Object :: grailbag:artifact_id() | read_handle()) ->
   {ok, Type, FileSize, BodyHash, Tags, Tokens} | undefined
