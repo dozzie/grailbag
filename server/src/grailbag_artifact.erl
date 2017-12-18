@@ -470,7 +470,6 @@ handle_call(finish = _Request, _From,
   % TODO: handle write errors
   ok = file:write_file(filename:join(Path, ?METADATA_FILE),
                        encode_info(ID, Type, Hash, Tags, [])),
-  % TODO: register this artifact
   NewState = State#state{
     body = undefined,
     hash = Hash

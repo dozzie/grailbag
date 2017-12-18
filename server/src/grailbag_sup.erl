@@ -37,6 +37,8 @@ init([] = _Args) ->
   Children = [
     {grailbag_log, {grailbag_log, start_link, [LogHandlers]},
       permanent, 5000, worker, [grailbag_log]},
+    {grailbag_reg, {grailbag_reg, start_link, []},
+      permanent, 5000, worker, [grailbag_reg]},
     {grailbag_artifact_sup, {grailbag_artifact_sup, start_link, []},
       permanent, 5000, supervisor, [grailbag_artifact_sup]},
     {grailbag_tcp_sup, {grailbag_tcp_sup, start_link, []},
