@@ -12,7 +12,7 @@
 -behaviour(gen_server).
 
 %% public interface
--export([record/4, delete/1]).
+-export([store/4, delete/1]).
 -export([list/1, info/1]).
 
 %% supervision tree API
@@ -51,12 +51,12 @@
 %% @see grailbag_artifact:create/2
 %% @see grailbag_artifact:finish/1
 
--spec record(grailbag:artifact_id(), grailbag:artifact_type(),
-             grailbag:body_hash(), [{grailbag:tag(), grailbag:tag_value()}]) ->
+-spec store(grailbag:artifact_id(), grailbag:artifact_type(),
+            grailbag:body_hash(), [{grailbag:tag(), grailbag:tag_value()}]) ->
   ok | {error, duplicate_id}.
 
-record(ID, Type, BodyHash, Tags) ->
-  gen_server:call(?MODULE, {record, ID, Type, BodyHash, Tags}, infinity).
+store(ID, Type, BodyHash, Tags) ->
+  gen_server:call(?MODULE, {store, ID, Type, BodyHash, Tags}, infinity).
 
 %% @doc Delete an artifact from memory and from disk.
 
@@ -185,8 +185,7 @@ terminate(_Arg, _State) ->
 %% @private
 %% @doc Handle {@link gen_server:call/2}.
 
-handle_call({record, ID, Type, Hash, Tags} = _Request, _From,
-            State) ->
+handle_call({store, ID, Type, Hash, Tags} = _Request, _From, State) ->
   Record = #artifact{
     id = ID,
     type = Type,
