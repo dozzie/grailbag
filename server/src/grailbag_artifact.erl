@@ -9,8 +9,10 @@
 %%%
 %%% @todo Save artifact's schema.
 %%% @todo Coordinate {@link delete/1}, {@link info/1},
-%%%   {@link update_tags/3}, and {@link update_tokens/3} (prevent race
+%%%   {@link update_tags/2}, and {@link update_tokens/2} (prevent race
 %%%   conditions).
+%%% @todo Make {@link update_tags/2} and {@link update_tokens/2} more
+%%%   efficient.
 %%% @end
 %%%---------------------------------------------------------------------------
 
@@ -21,7 +23,7 @@
 %% public interface
 -export([create/2, write/2, finish/1]).
 -export([open/1, read/2]).
--export([update_tags/3, update_tokens/3, delete/1, info/1]).
+-export([update_tags/2, update_tokens/2, delete/1, info/1]).
 -export([close/1]).
 
 %% supervision tree API
@@ -146,34 +148,72 @@ write(Handle, Data) ->
 finish(Handle) ->
   gen_server:call(Handle, finish, infinity).
 
-%% @doc Add and/or remove tags to/from specified artifact.
+%% @doc Update tags of specified artifact.
+%%
+%%   <b>NOTE</b>: This function does not check the tokens against artifact's
+%%   schema nor other artifacts of the same type.
+%%
+%%   <b>NOTE</b>: Function does not coordinate between different processes
+%%   that would want to update artifact's metadata.
+%%
+%% @see update_tokens/2
 
 -spec update_tags(grailbag:artifact_id(),
-                  Set :: [{grailbag:tag(), grailbag:tag_value()}],
-                  Unset :: [grailbag:tag()]) ->
+                  [{grailbag:tag(), grailbag:tag_value()}]) ->
   ok | {error, Reason}
   when Reason :: {schema, Dup :: [grailbag:tag()], Missing :: [grailbag:tag()]}
                | term().
 
-update_tags(ID, _Set, _Unset) ->
-  _Path = artifact_dir(ID),
-  'TODO'.
+update_tags(ID, Tags) ->
+  Path = artifact_dir(ID),
+  OldFile = filename:join(Path, ?METADATA_FILE),
+  NewFile = filename:join(Path, ?METADATA_UPDATE_FILE),
+  case decode_info_file(OldFile) of
+    % TODO: return error on mismatching ID
+    {ok, _ID, Type, BodyHash, _OldTags, Tokens} ->
+      case encode_info_file(NewFile, ID, Type, BodyHash, Tags, Tokens) of
+        ok ->
+          file:rename(NewFile, OldFile);
+        {error, Reason} ->
+          file:delete(NewFile),
+          {error, Reason}
+      end;
+    {error, Reason} ->
+      {error, Reason}
+  end.
 
-%% @doc Add and/or remove tokens to/from specified artifact.
+%% @doc Update tokens of specified artifact.
 %%
-%%   <b>NOTE</b>: This function does not remove tokens from other artifacts of
-%%   the same type.
+%%   <b>NOTE</b>: This function does not check the tokens against artifact's
+%%   schema nor other artifacts of the same type.
+%%
+%%   <b>NOTE</b>: Function does not coordinate between different processes
+%%   that would want to update artifact's metadata.
+%%
+%% @see update_tags/2
 
--spec update_tokens(grailbag:artifact_id(),
-                    Set :: [grailbag:token()],
-                    Unset :: [grailbag:token()]) ->
+-spec update_tokens(grailbag:artifact_id(), [grailbag:token()]) ->
   ok | {error, Reason}
   when Reason :: {schema, Unknown :: [grailbag:token()]}
                | term().
 
-update_tokens(ID, _Set, _Unset) ->
-  _Path = artifact_dir(ID),
-  'TODO'.
+update_tokens(ID, Tokens) ->
+  Path = artifact_dir(ID),
+  OldFile = filename:join(Path, ?METADATA_FILE),
+  NewFile = filename:join(Path, ?METADATA_UPDATE_FILE),
+  case decode_info_file(OldFile) of
+    % TODO: return error on mismatching ID
+    {ok, _ID, Type, BodyHash, Tags, _OldTokens} ->
+      case encode_info_file(NewFile, ID, Type, BodyHash, Tags, Tokens) of
+        ok ->
+          file:rename(NewFile, OldFile);
+        {error, Reason} ->
+          file:delete(NewFile),
+          {error, Reason}
+      end;
+    {error, Reason} ->
+      {error, Reason}
+  end.
 
 %% @doc Open an artifact for reading its body.
 
@@ -453,9 +493,26 @@ hash_final(Context) ->
 %%%---------------------------------------------------------------------------
 %%% encoding/decoding artifact metadata
 
+%% @doc Encode metadata and write it to artifact's info file.
+%%
+%% @see decode_info_file/1
+%% @see encode_info/5
+
+-spec encode_info_file(file:filename(),
+                       grailbag:artifact_id(), grailbag:artifact_type(),
+                       grailbag:body_hash(),
+                       [{grailbag:tag(), grailbag:tag_value()}],
+                       [grailbag:token()]) ->
+  ok | {error, file:posix()}.
+
+encode_info_file(File, ID, Type, Hash, Tags, Tokens) ->
+  Data = encode_info(ID, Type, Hash, Tags, Tokens),
+  file:write_file(File, Data).
+
 %% @doc Encode metadata for writing to artifact's info file.
 %%
 %% @see decode_info/1
+%% @see encode_info_file/6
 
 -spec encode_info(grailbag:artifact_id(), grailbag:artifact_type(),
                   grailbag:body_hash(),
@@ -500,8 +557,8 @@ encode_token(Token) ->
 
 %% @doc Decode metadata from artifact's info file.
 %%
+%% @see encode_info_file/6
 %% @see decode_info/1
-%% @see encode_info/5
 
 -spec decode_info_file(file:filename()) ->
     {ok, grailbag:artifact_id(), grailbag:artifact_type(),
@@ -519,8 +576,8 @@ decode_info_file(File) ->
 
 %% @doc Decode metadata from content of artifact's info file.
 %%
-%% @see decode_info_file/1
 %% @see encode_info/5
+%% @see decode_info_file/1
 
 -spec decode_info(binary()) ->
     {ok, grailbag:artifact_id(), grailbag:artifact_type(),
