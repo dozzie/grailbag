@@ -23,7 +23,7 @@
 %% public interface
 -export([create/2, write/2, finish/1]).
 -export([open/1, read/2]).
--export([update_tags/2, update_tokens/2, delete/1, info/1]).
+-export([update_tags/2, update_tokens/2, delete/1, info/1, list/0]).
 -export([close/1]).
 
 %% supervision tree API
@@ -288,6 +288,37 @@ info(_Handle = #artifact{type = Type, body_size = BodySize,
                          body_hash = BodyHash, tags = Tags,
                          tokens = Tokens}) ->
   {ok, Type, BodySize, BodyHash, Tags, Tokens}.
+
+%% @doc List known artifacts.
+
+-spec list() ->
+  [grailbag:artifact_id()].
+
+list() ->
+  {ok, DataDir} = application:get_env(grailbag, data_dir),
+  _Artifacts = [
+    list_to_binary(Name) ||
+    Name <- filelib:wildcard("????????-????-????-????-????????????", DataDir),
+    valid_artifact_dir(filename:join(DataDir, Name))
+  ].
+
+%% @doc Validate artifact directory.
+%%
+%%   It's a quite simple validation, just presence of a few known files.
+
+-spec valid_artifact_dir(file:filename()) ->
+  boolean().
+
+valid_artifact_dir(Path) ->
+  case file:read_file_info(filename:join(Path, ?BODY_FILE)) of
+    {ok, #file_info{type = regular, access = read_write}} ->
+      case file:read_file_info(filename:join(Path, ?METADATA_FILE)) of
+        {ok, #file_info{type = regular, access = read_write}} -> true;
+        _ -> false
+      end;
+    _ ->
+      false
+  end.
 
 %% @doc Close descriptors used for reading or writing an artifact.
 
