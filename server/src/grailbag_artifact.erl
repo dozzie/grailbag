@@ -609,7 +609,7 @@ decode_info_file(File) ->
 decode_info(Data) ->
   case Data of
     <<UUID:16/binary, TypeLen:16, Type:TypeLen/binary,
-      FileSize:64, HashLen:16, Hash:HashLen/binary, NTags:32, NTokens:32,
+      FileSize:64, HLen:16, Hash:HLen/binary, NTags:32, NTokens:32,
       TagsTokensData/binary>> ->
       ID = list_to_binary(grailbag_uuid:format(UUID)),
       try
@@ -628,20 +628,20 @@ decode_info(Data) ->
 
 %% @doc Decode specified number of tags and their values from binary data.
 
-decode_tags(0 = _NTags, Tags, Data) ->
+decode_tags(0 = _Count, Tags, Data) ->
   {lists:reverse(Tags), Data};
-decode_tags(NTags, Tags,
-            <<TagSize:16, ValueSize:32, Tag:TagSize/binary,
-              Value:ValueSize/binary, Rest/binary>> = _Data) ->
-  decode_tags(NTags - 1, [{binary:copy(Tag), binary:copy(Value)} | Tags], Rest).
+decode_tags(Count, Tags,
+            <<TLen:16, VLen:32, Tag:TLen/binary, Value:VLen/binary,
+              Rest/binary>> = _Data) ->
+  decode_tags(Count - 1, [{binary:copy(Tag), binary:copy(Value)} | Tags], Rest).
 
 %% @doc Decode specified number of token names from binary data.
 
-decode_tokens(0 = _NTokens, Tokens, Data) ->
+decode_tokens(0 = _Count, Tokens, Data) ->
   {lists:reverse(Tokens), Data};
-decode_tokens(NTokens, Tokens,
-              <<TokenSize:16, Token:TokenSize/binary, Rest/binary>> = _Data) ->
-  decode_tokens(NTokens - 1, [binary:copy(Token) | Tokens], Rest).
+decode_tokens(Count, Tokens,
+              <<TLen:16, Token:TLen/binary, Rest/binary>> = _Data) ->
+  decode_tokens(Count - 1, [binary:copy(Token) | Tokens], Rest).
 
 %%%---------------------------------------------------------------------------
 %%% vim:ft=erlang:foldmethod=marker
