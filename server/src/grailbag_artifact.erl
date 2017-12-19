@@ -47,12 +47,7 @@
 
 -record(artifact, {
   fh   :: file:fd(),
-  id   :: grailbag:artifact_id(),
-  type :: grailbag:artifact_type(),
-  body_hash :: grailbag:body_hash(),
-  body_size :: non_neg_integer(),
-  tags   :: [{grailbag:tag(), grailbag:tag_value()}],
-  tokens :: [grailbag:token()]
+  info :: grailbag:artifact_info()
 }).
 
 -record(state, {
@@ -182,8 +177,8 @@ update_tags(ID, Tags) ->
   NewFile = filename:join(Path, ?METADATA_UPDATE_FILE),
   case decode_info_file(OldFile) of
     % TODO: return error on mismatching ID
-    {ok, _ID, Type, BodyHash, _OldTags, Tokens} ->
-      case encode_info_file(NewFile, ID, Type, BodyHash, Tags, Tokens) of
+    {ok, {_ID, Type, Size, Hash, _OldTags, Tokens}} ->
+      case encode_info_file(NewFile, ID, Type, Size, Hash, Tags, Tokens) of
         ok ->
           file:rename(NewFile, OldFile);
         {error, Reason} ->
@@ -215,8 +210,8 @@ update_tokens(ID, Tokens) ->
   NewFile = filename:join(Path, ?METADATA_UPDATE_FILE),
   case decode_info_file(OldFile) of
     % TODO: return error on mismatching ID
-    {ok, _ID, Type, BodyHash, Tags, _OldTokens} ->
-      case encode_info_file(NewFile, ID, Type, BodyHash, Tags, Tokens) of
+    {ok, {_ID, Type, Size, Hash, Tags, _OldTokens}} ->
+      case encode_info_file(NewFile, ID, Type, Size, Hash, Tags, Tokens) of
         ok ->
           file:rename(NewFile, OldFile);
         {error, Reason} ->
@@ -243,17 +238,10 @@ open(ID) ->
   case file:open(filename:join(Path, ?BODY_FILE), [raw, read, binary]) of
     {ok, FH} ->
       case decode_info_file(filename:join(Path, ?METADATA_FILE)) of
-        {ok, ID, Type, BodyHash, Tags, Tokens} ->
-          {ok, BodySize} = file:position(FH, eof),
-          {ok, 0} = file:position(FH, bof),
+        {ok, ArtifactInfo} ->
           Handle = #artifact{
             fh = FH,
-            id = ID,
-            type = Type,
-            body_hash = BodyHash,
-            body_size = BodySize,
-            tags = Tags,
-            tokens = Tokens
+            info = ArtifactInfo
           },
           {ok, Handle};
         {error, badarg} ->
@@ -285,30 +273,16 @@ read(_Handle = #artifact{fh = FH}, Size) ->
 %% @see open/1
 
 -spec info(Object :: grailbag:artifact_id() | read_handle()) ->
-  {ok, Type, FileSize, BodyHash, Tags, Tokens} | undefined
-  when Type :: grailbag:artifact_type(),
-       FileSize :: non_neg_integer(),
-       BodyHash :: grailbag:body_hash(),
-       Tags :: [{grailbag:tag(), grailbag:tag_value()}],
-       Tokens :: [grailbag:token()].
+  {ok, grailbag:artifact_info()} | undefined.
 
 info(ID) when is_binary(ID) ->
   Path = artifact_dir(ID),
-  case file:read_file_info(filename:join(Path, ?BODY_FILE)) of
-    {ok, #file_info{size = BodySize}} ->
-      case decode_info_file(filename:join(Path, ?METADATA_FILE)) of
-        {ok, _ID, Type, BodyHash, Tags, Tokens} ->
-          {ok, Type, BodySize, BodyHash, Tags, Tokens};
-        {error, _} ->
-          undefined
-      end;
-    {error, _} ->
-      undefined
+  case decode_info_file(filename:join(Path, ?METADATA_FILE)) of
+    {ok, ArtifactInfo} -> {ok, ArtifactInfo};
+    {error, _} -> undefined
   end;
-info(_Handle = #artifact{type = Type, body_size = BodySize,
-                         body_hash = BodyHash, tags = Tags,
-                         tokens = Tokens}) ->
-  {ok, Type, BodySize, BodyHash, Tags, Tokens}.
+info(_Handle = #artifact{info = ArtifactInfo}) ->
+  {ok, ArtifactInfo}.
 
 %% @doc List known artifacts.
 
@@ -462,6 +436,7 @@ handle_call(finish = _Request, _From,
 handle_call(finish = _Request, _From,
             State = #state{path = Path, body = FH, hash = HashContext,
                            metadata = {ID, Type, Tags}}) ->
+  {ok, FileSize} = file:position(FH, cur),
   file:close(FH),
   file:rename(filename:join(Path, ?UPLOAD_FILE),
               filename:join(Path, ?BODY_FILE)),
@@ -469,7 +444,7 @@ handle_call(finish = _Request, _From,
   % TODO: write `filename:join(Path, ?SCHEMA_FILE)'
   % TODO: handle write errors
   ok = file:write_file(filename:join(Path, ?METADATA_FILE),
-                       encode_info(ID, Type, Hash, Tags, [])),
+                       encode_info(ID, Type, FileSize, Hash, Tags, [])),
   NewState = State#state{
     body = undefined,
     hash = Hash
@@ -551,13 +526,13 @@ hash_final(Context) ->
 
 -spec encode_info_file(file:filename(),
                        grailbag:artifact_id(), grailbag:artifact_type(),
-                       grailbag:body_hash(),
+                       grailbag:file_size(), grailbag:body_hash(),
                        [{grailbag:tag(), grailbag:tag_value()}],
                        [grailbag:token()]) ->
   ok | {error, file:posix()}.
 
-encode_info_file(File, ID, Type, Hash, Tags, Tokens) ->
-  Data = encode_info(ID, Type, Hash, Tags, Tokens),
+encode_info_file(File, ID, Type, Size, Hash, Tags, Tokens) ->
+  Data = encode_info(ID, Type, Size, Hash, Tags, Tokens),
   file:write_file(File, Data).
 
 %% @doc Encode metadata for writing to artifact's info file.
@@ -566,17 +541,18 @@ encode_info_file(File, ID, Type, Hash, Tags, Tokens) ->
 %% @see encode_info_file/6
 
 -spec encode_info(grailbag:artifact_id(), grailbag:artifact_type(),
-                  grailbag:body_hash(),
+                  grailbag:file_size(), grailbag:body_hash(),
                   [{grailbag:tag(), grailbag:tag_value()}],
                   [grailbag:token()]) ->
   iolist().
 
-encode_info(ID, Type, Hash, Tags, Tokens) ->
+encode_info(ID, Type, Size, Hash, Tags, Tokens) ->
   % TODO: add a checksum of this info
   % TODO: add upload time
   _Result = [
     grailbag_uuid:parse(binary_to_list(ID)),
     <<(size(Type)):16>>, Type,
+    <<Size:64>>,
     <<(size(Hash)):16>>, Hash,
     <<(length(Tags)):32>>,
     <<(length(Tokens)):32>>,
@@ -612,10 +588,7 @@ encode_token(Token) ->
 %% @see decode_info/1
 
 -spec decode_info_file(file:filename()) ->
-    {ok, grailbag:artifact_id(), grailbag:artifact_type(),
-      grailbag:body_hash(), [{grailbag:tag(), grailbag:tag_value()}],
-      [grailbag:token()]}
-  | {error, badarg | file:posix()}.
+  {ok, grailbag:artifact_info()} | {error, badarg | file:posix()}.
 
 decode_info_file(File) ->
   % the file, even accounting for tags, should be small, especially that all
@@ -631,21 +604,20 @@ decode_info_file(File) ->
 %% @see decode_info_file/1
 
 -spec decode_info(binary()) ->
-    {ok, grailbag:artifact_id(), grailbag:artifact_type(),
-      grailbag:body_hash(), [{grailbag:tag(), grailbag:tag_value()}],
-      [grailbag:token()]}
-  | {error, badarg}.
+  {ok, grailbag:artifact_info()} | {error, badarg}.
 
 decode_info(Data) ->
   case Data of
     <<UUID:16/binary, TypeLen:16, Type:TypeLen/binary,
-      HashLen:16, Hash:HashLen/binary, NTags:32, NTokens:32,
+      FileSize:64, HashLen:16, Hash:HashLen/binary, NTags:32, NTokens:32,
       TagsTokensData/binary>> ->
       ID = list_to_binary(grailbag_uuid:format(UUID)),
       try
         {Tags, TokensData} = decode_tags(NTags, [], TagsTokensData),
         {Tokens, <<>>} = decode_tokens(NTokens, [], TokensData),
-        {ok, ID, binary:copy(Type), binary:copy(Hash), Tags, Tokens}
+        ArtifactInfo =
+          {ID, binary:copy(Type), FileSize, binary:copy(Hash), Tags, Tokens},
+        {ok, ArtifactInfo}
       catch
         _:_ ->
           {error, badarg}

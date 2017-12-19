@@ -12,7 +12,7 @@
 -behaviour(gen_server).
 
 %% public interface
--export([store/4, delete/1]).
+-export([store/5, delete/1]).
 -export([list/1, info/1]).
 
 %% supervision tree API
@@ -32,6 +32,7 @@
 -record(artifact, {
   id :: grailbag:artifact_id(),
   type :: grailbag:artifact_type(),
+  body_size :: non_neg_integer(),
   body_hash :: grailbag:body_hash(),
   tags :: [{grailbag:tag(), grailbag:tag_value()}],
   tokens :: [grailbag:token()]
@@ -51,12 +52,13 @@
 %% @see grailbag_artifact:create/2
 %% @see grailbag_artifact:finish/1
 
--spec store(grailbag:artifact_id(), grailbag:artifact_type(),
+-spec store(grailbag:artifact_id(), grailbag:artifact_type(), non_neg_integer(),
             grailbag:body_hash(), [{grailbag:tag(), grailbag:tag_value()}]) ->
   ok | {error, duplicate_id}.
 
-store(ID, Type, BodyHash, Tags) ->
-  gen_server:call(?MODULE, {store, ID, Type, BodyHash, Tags}, infinity).
+store(ID, Type, BodySize, BodyHash, Tags) ->
+  gen_server:call(?MODULE, {store, {ID, Type, BodySize, BodyHash, Tags, []}},
+                  infinity).
 
 %% @doc Delete an artifact from memory and from disk.
 
@@ -76,11 +78,7 @@ delete(ID) ->
 %% @doc List metadata of all artifacts of specific type.
 
 -spec list(grailbag:artifact_type()) ->
-  [{ID, BodyHash, Tags, Tokens}]
-  when ID :: grailbag:artifact_id(),
-       BodyHash :: grailbag:body_hash(),
-       Tags :: [{grailbag:tag(), grailbag:tag_value()}],
-       Tokens :: [grailbag:token()].
+  [grailbag:artifact_info()].
 
 list(Type) ->
   Records = ets:lookup(?TYPE_TABLE, Type),
@@ -90,25 +88,20 @@ list(Type) ->
 
 add_artifact_info({_, ID}, Artifacts) ->
   case info(ID) of
-    {ok, _Type, Hash, Tags, Tokens} ->
-      [{ID, Hash, Tags, Tokens} | Artifacts];
-    undefined ->
-      Artifacts
+    {ok, Info} -> [Info | Artifacts];
+    undefined -> Artifacts
   end.
 
 %% @doc Get artifact's metadata.
 
 -spec info(grailbag:artifact_id()) ->
-  {ok, Type, BodyHash, Tags, Tokens} | undefined
-  when Type :: grailbag:artifact_type(),
-       BodyHash :: grailbag:body_hash(),
-       Tags :: [{grailbag:tag(), grailbag:tag_value()}],
-       Tokens :: [grailbag:token()].
+  {ok, grailbag:artifact_info()} | undefined.
 
 info(ID) ->
   case ets:lookup(?ARTIFACT_TABLE, ID) of
-    [#artifact{type = Type, body_hash = Hash, tags = Tags, tokens = Tokens}] ->
-      {ok, Type, Hash, Tags, Tokens};
+    [#artifact{type = Type, body_size = Size, body_hash = Hash,
+               tags = Tags, tokens = Tokens}] ->
+      {ok, {ID, Type, Size, Hash, Tags, Tokens}};
     [] ->
       undefined
   end.
@@ -147,14 +140,8 @@ init(_Args) ->
   lists:foldl(
     fun(ID, Acc) ->
       case grailbag_artifact:info(ID) of
-        {ok, Type, _BodySize, Hash, Tags, Tokens} ->
-          ets:insert(?ARTIFACT_TABLE, #artifact{
-            id = ID,
-            type = Type,
-            body_hash = Hash,
-            tags = Tags,
-            tokens = Tokens
-          }),
+        {ok, {ID, Type, _Size, _Hash, _Tags, _Tokens} = ArtifactInfo} ->
+          ets:insert(?ARTIFACT_TABLE, make_record(ArtifactInfo)),
           ets:insert(?TYPE_TABLE, {Type, ID}),
           Acc;
         undefined ->
@@ -185,15 +172,9 @@ terminate(_Arg, _State) ->
 %% @private
 %% @doc Handle {@link gen_server:call/2}.
 
-handle_call({store, ID, Type, Hash, Tags} = _Request, _From, State) ->
-  Record = #artifact{
-    id = ID,
-    type = Type,
-    body_hash = Hash,
-    tags = Tags,
-    tokens = []
-  },
-  case ets:insert_new(?ARTIFACT_TABLE, Record) of
+handle_call({store, {ID, Type, _Size, _Hash, _Tags, []} = Info} = _Request,
+            _From, State) ->
+  case ets:insert_new(?ARTIFACT_TABLE, make_record(Info)) of
     true ->
       ets:insert(?TYPE_TABLE, {Type, ID}),
       {reply, ok, State};
@@ -243,6 +224,23 @@ code_change(_OldVsn, State, _Extra) ->
 
 %% }}}
 %%----------------------------------------------------------
+
+%%%---------------------------------------------------------------------------
+
+%% @doc Make record suitable for ETS table from artifact info.
+
+-spec make_record(grailbag:artifact_info()) ->
+  #artifact{}.
+
+make_record({ID, Type, Size, Hash, Tags, Tokens} = _Info) ->
+  #artifact{
+    id = ID,
+    type = Type,
+    body_size = Size,
+    body_hash = Hash,
+    tags = Tags,
+    tokens = Tokens
+  }.
 
 %%%---------------------------------------------------------------------------
 %%% vim:ft=erlang:foldmethod=marker
