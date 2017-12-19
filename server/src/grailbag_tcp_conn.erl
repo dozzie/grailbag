@@ -22,8 +22,14 @@
 %%%---------------------------------------------------------------------------
 %%% types {{{
 
+-define(EVENT_ID_TODO, <<0:128>>).
+-define(EVENT_ID_UNIMPLEMENTED, <<16#ffffffffffffffff:64, 16#ffffffffffffffff:64>>).
+
 -record(state, {
-  socket :: gen_tcp:socket()
+  socket :: gen_tcp:socket(),
+  handle :: undefined
+          | {upload, grailbag_artifact:write_handle()}
+          | {download, grailbag_artifact:read_handle()}
 }).
 
 %%% }}}
@@ -45,7 +51,7 @@ take_over(Socket) ->
   case grailbag_tcp_conn_sup:spawn_worker(Socket) of
     {ok, Pid} ->
       ok = gen_tcp:controlling_process(Socket, Pid),
-      inet:setopts(Socket, [binary, {packet, raw}, {active, once}]),
+      inet:setopts(Socket, [binary, {packet, 4}, {active, once}]),
       {ok, Pid};
     {error, Reason} ->
       gen_tcp:close(Socket),
@@ -119,11 +125,63 @@ handle_cast(_Request, State) ->
 %% @private
 %% @doc Handle incoming messages.
 
-handle_info({tcp, Socket, _Data} = _Message,
+handle_info({tcp, Socket, Data} = _Message,
             State = #state{socket = Socket}) ->
-  % TODO: process the data
-  inet:setopts(Socket, [{active, once}]),
-  {noreply, State};
+  % TODO: don't close the connection after the request
+  case decode_request(Data) of
+    {store, _Type, _Tags} -> % long running connection
+      % TODO: grailbag_artifact:create(Type, Tags) ->
+      %       grailbag_artifact:write() ->
+      %       grailbag_artifact:finish() ->
+      %       grailbag_reg:store()
+      Reply = encode_error({server_error, ?EVENT_ID_UNIMPLEMENTED}),
+      gen_tcp:send(Socket, Reply),
+      {stop, normal, State};
+    {delete, ID} ->
+      Reply = case grailbag_reg:delete(ID) of
+        ok -> encode_success(ID);
+        {error, bad_id} -> encode_error(unknown_artifact);
+        % TODO: log this error
+        {error, _Reason} -> encode_error({server_error, ?EVENT_ID_TODO})
+      end,
+      gen_tcp:send(Socket, Reply),
+      {stop, normal, State};
+    {update_tags, _ID, _Tags, _UnsetTags} ->
+      % TODO: grailbag_reg:update_tags()
+      gen_tcp:send(Socket, "TODO"),
+      {stop, normal, State};
+    {update_tokens, _ID, _Tokens, _UnsetTokens} ->
+      % TODO: grailbag_reg:update_tokens()
+      gen_tcp:send(Socket, "TODO"),
+      {stop, normal, State};
+    {list, Type} ->
+      % TODO: check if the type is known
+      Artifacts = grailbag_reg:list(Type),
+      Reply = encode_list(Artifacts),
+      gen_tcp:send(Socket, Reply),
+      {stop, normal, State};
+    % TODO: `{watch, Type, ...}' (long running)
+    {info, ID} ->
+      Reply = case grailbag_reg:info(ID) of
+        {ok, Info} -> encode_info(Info);
+        undefined -> encode_error(unknown_artifact)
+      end,
+      gen_tcp:send(Socket, Reply),
+      {stop, normal, State};
+    {get, ID} -> % potentially long running connection
+      % TODO: grailbag_artifact:open(ID),
+      %       grailbag_artifact:info(),
+      %       grailbag_artifact:read()
+      Reply = case grailbag_reg:info(ID) of
+        {ok, Info} -> encode_info(Info);
+        undefined -> encode_error(unknown_artifact)
+      end,
+      gen_tcp:send(Socket, Reply),
+      {stop, normal, State};
+    {error, badarg} ->
+      % protocol error
+      {stop, normal, State}
+  end;
 
 handle_info({tcp_closed, Socket} = _Message,
             State = #state{socket = Socket}) ->
@@ -152,8 +210,248 @@ code_change(_OldVsn, State, _Extra) ->
 %%----------------------------------------------------------
 
 %%%---------------------------------------------------------------------------
+%%% protocol handling
+%%%---------------------------------------------------------------------------
+
+%%----------------------------------------------------------
+%% encode_success(), encode_info(), encode_list() {{{
+
+%% @doc Encode "operation succeeded" message.
+
+-spec encode_success(grailbag:artifact_id()) ->
+  binary().
+
+encode_success(ID) ->
+  UUID = grailbag_uuid:parse(binary_to_list(ID)),
+  <<0:4, 0:28, UUID/binary>>.
+
+%% @doc Encode message with artifact metadata.
+
+-spec encode_info(grailbag:artifact_info()) ->
+  iolist().
+
+encode_info(Info) ->
+  _Result = [<<1:4, 0:28>>, encode_artifact_info(Info)].
+
+%% @doc Encode message with list of artifacts.
+
+-spec encode_list([grailbag:artifact_info()]) ->
+  iolist().
+
+encode_list(Artifacts) ->
+  _Result = [
+    <<2:4, (length(Artifacts)):28>>,
+    [encode_artifact_info(Info) || Info <- Artifacts]
+  ].
+
+%% @doc Encode information about a single artifact.
+%%
+%% @see encode_info/1
+%% @see encode_list/1
+
+-spec encode_artifact_info(grailbag:artifact_info()) ->
+  iolist().
+
+encode_artifact_info({ID, Type, FileSize, Hash, Tags, Tokens} = _Info) ->
+  _Result = [
+    grailbag_uuid:parse(binary_to_list(ID)),
+    <<(size(Type)):16>>, Type,
+    <<FileSize:64>>,
+    <<(size(Hash)):16>>, Hash,
+    <<(length(Tags)):32>>,
+    <<(length(Tokens)):32>>,
+    [encode_tag(Tag, Value) || {Tag, Value} <- Tags],
+    [encode_token(T) || T <- Tokens]
+  ].
+
+%% @doc Encode tag (its name and value).
+%%
+%% @see encode_artifact_info/1
+
+-spec encode_tag(grailbag:tag(), grailbag:token()) ->
+  iolist().
+
+encode_tag(Tag, Value) ->
+  [<<(size(Tag)):16>>, <<(size(Value)):32>>, Tag, Value].
+
+%% @doc Encode token name.
+%%
+%% @see encode_artifact_info/1
+
+-spec encode_token(grailbag:token()) ->
+  iolist().
+
+encode_token(Token) ->
+  [<<(size(Token)):16>>, Token].
+
+%% }}}
+%%----------------------------------------------------------
+%% encode_error() {{{
+
+%% @doc Encode an error message for client.
+
+-spec encode_error(Error) ->
+  binary()
+  when Error :: {server_error, grailbag_uuid:uuid()}
+              | unknown_artifact
+              | unknown_type
+              | body_checksum_mismatch
+              | artifact_has_tokens
+              | {schema, [term()]}.
+
+encode_error({server_error, EventID}) when bit_size(EventID) == 128 ->
+  <<14:4, 0:28, EventID:128/bitstring>>;
+encode_error(unknown_artifact) ->
+  <<15:4, 0:12, 0:16>>;
+encode_error(unknown_type) ->
+  <<15:4, 1:12, 0:16>>;
+encode_error(body_checksum_mismatch) ->
+  <<15:4, 2:12, 0:16>>;
+encode_error(artifact_has_tokens) ->
+  <<15:4, 3:12, 0:16>>;
+encode_error({schema, _TODO}) ->
+  % TODO: encode the errors
+  NErrors = 0,
+  Errors = <<>>,
+  <<15:4, 4:12, NErrors:16, Errors/binary>>.
+
+%% }}}
+%%----------------------------------------------------------
+%% decode_request() {{{
+
+%% @doc Decode request from a client.
+
+-spec decode_request(Request :: binary()) ->
+    {store, Type, Tags}
+  | {delete, ID}
+  | {update_tags, ID, Tags, UnsetTags}
+  | {update_tokens, ID, Tokens, UnsetTokens}
+  | {list, Type}
+  %| {watch, Type, ...} % TODO
+  | {info, ID}
+  | {get, ID}
+  | {error, badarg}
+  when ID :: grailbag:artifact_id(),
+       Type :: grailbag:artifact_type(),
+       Tags :: [{grailbag:tag(), grailbag:tag_value()}],
+       UnsetTags :: [grailbag:tag()],
+       Tokens :: [grailbag:token()],
+       UnsetTokens :: [grailbag:token()].
+
+decode_request(<<"S", TypeLen:16, Type:TypeLen/binary,
+               NTags:32, TagsData/binary>>) ->
+  case decode_tag_pairs(NTags, [], TagsData) of
+    {Tags, <<>>} -> {store, Type, Tags};
+    _ -> {error, badarg} % either a decode error or non-zero remaining data
+  end;
+decode_request(<<"D", UUID:128/bitstring>>) ->
+  {delete, decode_id(UUID)};
+decode_request(<<"A", UUID:128/bitstring,
+               NSTags:32, NUTags:32, TagsData/binary>>) ->
+  case decode_tag_pairs(NSTags, [], TagsData) of
+    {SetTags, UnsetTagsData} ->
+      case decode_names(NUTags, [], UnsetTagsData) of
+        {UnsetTags, <<>>} -> {update_tags, decode_id(UUID), SetTags, UnsetTags};
+        _ -> {error, badarg} % either a decode error or non-zero remaining data
+      end;
+    error ->
+      {error, badarg}
+  end;
+decode_request(<<"O", UUID:128/bitstring,
+               NSTokens:32, NUTokens:32, TokensData/binary>>) ->
+  case decode_names(NSTokens, [], TokensData) of
+    {SetTokens, UnsetTokensData} ->
+      case decode_names(NUTokens, [], UnsetTokensData) of
+        {UnsetTokens, <<>>} ->
+          {update_tokens, decode_id(UUID), SetTokens, UnsetTokens};
+        _ ->
+          {error, badarg} % either a decode error or non-zero remaining data
+      end;
+    error ->
+      {error, badarg}
+  end;
+decode_request(<<"L", TypeLen:16, Type:TypeLen/binary>>) ->
+  {list, Type};
+%decode_request(<<"W", TypeLen:16, Type:TypeLen/binary, QueryData/binary>>) ->
+%  % TODO: process `QueryData'
+%  {watch, Type, ...};
+decode_request(<<"I", UUID:128/bitstring>>) ->
+  {info, decode_id(UUID)};
+decode_request(<<"G", UUID:128/bitstring>>) ->
+  {get, decode_id(UUID)};
+decode_request(_) ->
+  {error, badarg}.
+
+%% }}}
+%%----------------------------------------------------------
+%% decode_id(), decode_tag_pairs(), decode_names() {{{
+
+%% @doc Decode artifact ID from 128-bit value.
+
+-spec decode_id(binary()) ->
+  grailbag:artifact_id().
+
+decode_id(UUID) when bit_size(UUID) == 128 ->
+  list_to_binary(grailbag_uuid:format(UUID)).
+
+%% @doc Decode tag-value pairs from a binary payload.
+%%
+%%   A pair is composed of 16-bit length of tag name, 32-bit length tag value,
+%%   tag name, and tag value. Integers are in network byte order (big endian).
+%%
+%%   Tag names and values do not reference the `Data' binary.
+
+-spec decode_tag_pairs(non_neg_integer(), Acc :: [TagValue], binary()) ->
+  {Tags :: [TagValue], Rest :: binary()} | error
+  when TagValue :: {grailbag:tag(), grailbag:tag_value()}.
+
+decode_tag_pairs(0 = _NPairs, Pairs, Data) ->
+  % reverse the list and make copy of all binaries in one go
+  ReversedPairs = lists:foldl(
+    fun({N,V}, Acc) -> [{binary:copy(N), binary:copy(V)} | Acc] end,
+    [],
+    Pairs
+  ),
+  {ReversedPairs, Data};
+decode_tag_pairs(NPairs, Pairs,
+                        <<NSize:16, VSize:32, Name:NSize/binary,
+                        Value:VSize/binary, Rest/binary>> = _Data) ->
+  decode_tag_pairs(NPairs - 1, [{Name, Value} | Pairs], Rest);
+decode_tag_pairs(_NPairs, _Pairs, _Data) ->
+  error.
+
+%% @doc Decode tag or token names from a binary payload.
+%%
+%%   A name is prefixed with 16-bit length, network byte order (big endian).
+%%
+%%   Names do not reference the `Data' binary.
+
+-spec decode_names(non_neg_integer(), Acc :: [Name], binary()) ->
+  {Names :: [Name], Rest :: binary()} | error
+  when Name :: binary().
+
+decode_names(0 = _N, Names, Data) ->
+  % reverse the list and make copy of all binaries in one go
+  ReversedNames = lists:foldl(
+    fun(Name, Acc) -> [binary:copy(Name) | Acc] end,
+    [],
+    Names
+  ),
+  {ReversedNames, Data};
+decode_names(N, Names, <<NSize:16, Name:NSize/binary, Rest/binary>> = _Data) ->
+  decode_names(N - 1, [Name | Names], Rest);
+decode_names(_N, _Names, _Data) ->
+  error.
+
+%% }}}
+%%----------------------------------------------------------
+
+%%%---------------------------------------------------------------------------
 %%% helper functions
 %%%---------------------------------------------------------------------------
+
+%%----------------------------------------------------------
+%% format_address() {{{
 
 %% @doc Format IP address and port number for logging.
 
@@ -229,6 +527,9 @@ add_colons([""]) -> "";
 add_colons([F]) -> integer_to_list(F, 16);
 add_colons(["" | Rest]) -> ":" ++ add_colons(Rest);
 add_colons([F | Rest]) -> integer_to_list(F, 16) ++ ":" ++ add_colons(Rest).
+
+%% }}}
+%%----------------------------------------------------------
 
 %%%---------------------------------------------------------------------------
 %%% vim:ft=erlang:foldmethod=marker
