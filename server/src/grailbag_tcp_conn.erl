@@ -126,7 +126,7 @@ handle_cast(_Request, State) ->
 %% @doc Handle incoming messages.
 
 handle_info({tcp, Socket, Data} = _Message,
-            State = #state{socket = Socket}) ->
+            State = #state{socket = Socket, handle = undefined}) ->
   % TODO: don't close the connection after the request
   case decode_request(Data) of
     {store, _Type, _Tags} -> % long running connection
@@ -145,21 +145,23 @@ handle_info({tcp, Socket, Data} = _Message,
         {error, _Reason} -> encode_error({server_error, ?EVENT_ID_TODO})
       end,
       gen_tcp:send(Socket, Reply),
-      {stop, normal, State};
+      {noreply, State};
     {update_tags, _ID, _Tags, _UnsetTags} ->
       % TODO: grailbag_reg:update_tags()
-      gen_tcp:send(Socket, "TODO"),
-      {stop, normal, State};
+      Reply = encode_error({server_error, ?EVENT_ID_UNIMPLEMENTED}),
+      gen_tcp:send(Socket, Reply),
+      {noreply, State};
     {update_tokens, _ID, _Tokens, _UnsetTokens} ->
       % TODO: grailbag_reg:update_tokens()
-      gen_tcp:send(Socket, "TODO"),
-      {stop, normal, State};
+      Reply = encode_error({server_error, ?EVENT_ID_UNIMPLEMENTED}),
+      gen_tcp:send(Socket, Reply),
+      {noreply, State};
     {list, Type} ->
       % TODO: check if the type is known
       Artifacts = grailbag_reg:list(Type),
       Reply = encode_list(Artifacts),
       gen_tcp:send(Socket, Reply),
-      {stop, normal, State};
+      {noreply, State};
     % TODO: `{watch, Type, ...}' (long running)
     {info, ID} ->
       Reply = case grailbag_reg:info(ID) of
@@ -167,7 +169,7 @@ handle_info({tcp, Socket, Data} = _Message,
         undefined -> encode_error(unknown_artifact)
       end,
       gen_tcp:send(Socket, Reply),
-      {stop, normal, State};
+      {noreply, State};
     {get, ID} -> % potentially long running connection
       % TODO: grailbag_artifact:open(ID),
       %       grailbag_artifact:info(),
@@ -177,7 +179,7 @@ handle_info({tcp, Socket, Data} = _Message,
         undefined -> encode_error(unknown_artifact)
       end,
       gen_tcp:send(Socket, Reply),
-      {stop, normal, State};
+      {noreply, State};
     {error, badarg} ->
       % protocol error
       {stop, normal, State}
@@ -189,7 +191,7 @@ handle_info({tcp_closed, Socket} = _Message,
 
 handle_info({tcp_error, Socket, Reason} = _Message,
             State = #state{socket = Socket}) ->
-  grailbag_log:warn("TCP socket closed abnormally", [{error, {term, Reason}}]),
+  grailbag_log:info("TCP socket closed abnormally", [{error, {term, Reason}}]),
   {stop, normal, State};
 
 %% unknown messages
