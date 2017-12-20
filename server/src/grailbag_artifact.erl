@@ -229,7 +229,7 @@ update_tokens(ID, Tokens) ->
 %% @see close/1
 
 -spec open(grailbag:artifact_id()) ->
-  {ok, read_handle()} | {error, Reason}
+  {ok, read_handle()} | {error, bad_id | Reason}
   when Reason :: {body, file:posix()}
                | {metadata, format | file:posix()}.
 
@@ -251,6 +251,8 @@ open(ID) ->
           file:close(FH),
           {error, {metadata, Reason}}
       end;
+    {error, enoent} ->
+      {error, bad_id};
     {error, Reason} ->
       {error, {body, Reason}}
   end.

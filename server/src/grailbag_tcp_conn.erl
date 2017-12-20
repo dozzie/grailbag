@@ -28,8 +28,8 @@
 -record(state, {
   socket :: gen_tcp:socket(),
   handle :: undefined
-          | {upload, grailbag_artifact:write_handle()}
-          | {download, grailbag_artifact:read_handle()}
+          | {upload, grailbag:artifact_id(), grailbag_artifact:write_handle()}
+          | {download, grailbag:artifact_id(), grailbag_artifact:read_handle()}
 }).
 
 %%% }}}
@@ -93,14 +93,19 @@ init([Socket] = _Args) ->
   ]),
   grailbag_log:info("new connection"),
   State = #state{
-    socket = Socket
+    socket = Socket,
+    handle = undefined
   },
   {ok, State}.
 
 %% @private
 %% @doc Clean up after event handler.
 
-terminate(_Arg, _State = #state{socket = Socket}) ->
+terminate(_Arg, _State = #state{socket = Socket, handle = Handle}) ->
+  case Handle of
+    undefined -> ok;
+    {_, _, H} -> grailbag_artifact:close(H)
+  end,
   gen_tcp:close(Socket),
   ok.
 
@@ -113,21 +118,57 @@ terminate(_Arg, _State = #state{socket = Socket}) ->
 
 %% unknown calls
 handle_call(_Request, _From, State) ->
-  {reply, {error, unknown_call}, State}.
+  {reply, {error, unknown_call}, State, 0}.
 
 %% @private
 %% @doc Handle {@link gen_server:cast/2}.
 
 %% unknown casts
 handle_cast(_Request, State) ->
-  {noreply, State}.
+  {noreply, State, 0}.
 
 %% @private
 %% @doc Handle incoming messages.
 
+handle_info(timeout = _Message, State = #state{handle = undefined}) ->
+  % break out of timeout loop
+  {noreply, State};
+
+handle_info(timeout = _Message,
+            State = #state{handle = {upload, _ID, _Handle}}) ->
+  % do nothing, wait for client to send another chunk
+  {noreply, State};
+
+handle_info(timeout = _Message,
+            State = #state{socket = Socket, handle = {download, ID, Handle}}) ->
+  % timeout->read->send->timeout loop
+  case grailbag_artifact:read(Handle, 16 * 1024) of
+    {ok, Data} ->
+      case gen_tcp:send(Socket, Data) of
+        ok ->
+          {noreply, State, 0};
+        {error, Reason} ->
+          grailbag_log:info("TCP send error", [{error, {term, Reason}}]),
+          {stop, normal, State}
+      end;
+    eof ->
+      % TODO: check if the amount of data read/sent equals to what was
+      % reported to the client
+      grailbag_artifact:close(Handle),
+      % go back to (a) reading with (b) 4-byte size prefix
+      inet:setopts(Socket, [{active, once}, {packet, 4}]),
+      NewState = State#state{handle = undefined},
+      {noreply, NewState};
+    {error, Reason} ->
+      grailbag_log:warn("artifact read error", [
+        {artifact, ID},
+        {error, {term, Reason}}
+      ]),
+      {stop, normal, State}
+  end;
+
 handle_info({tcp, Socket, Data} = _Message,
             State = #state{socket = Socket, handle = undefined}) ->
-  % TODO: don't close the connection after the request
   case decode_request(Data) of
     {store, _Type, _Tags} -> % long running connection
       % TODO: grailbag_artifact:create(Type, Tags) ->
@@ -144,42 +185,84 @@ handle_info({tcp, Socket, Data} = _Message,
         % TODO: log this error
         {error, _Reason} -> encode_error({server_error, ?EVENT_ID_TODO})
       end,
-      gen_tcp:send(Socket, Reply),
-      {noreply, State};
+      case gen_tcp:send(Socket, Reply) of
+        ok ->
+          inet:setopts(Socket, [{active, once}]),
+          {noreply, State};
+        {error, _} ->
+          {stop, normal, State}
+      end;
     {update_tags, _ID, _Tags, _UnsetTags} ->
       % TODO: grailbag_reg:update_tags()
       Reply = encode_error({server_error, ?EVENT_ID_UNIMPLEMENTED}),
-      gen_tcp:send(Socket, Reply),
-      {noreply, State};
+      case gen_tcp:send(Socket, Reply) of
+        ok ->
+          inet:setopts(Socket, [{active, once}]),
+          {noreply, State};
+        {error, _} ->
+          {stop, normal, State}
+      end;
     {update_tokens, _ID, _Tokens, _UnsetTokens} ->
       % TODO: grailbag_reg:update_tokens()
       Reply = encode_error({server_error, ?EVENT_ID_UNIMPLEMENTED}),
-      gen_tcp:send(Socket, Reply),
-      {noreply, State};
+      case gen_tcp:send(Socket, Reply) of
+        ok ->
+          inet:setopts(Socket, [{active, once}]),
+          {noreply, State};
+        {error, _} ->
+          {stop, normal, State}
+      end;
     {list, Type} ->
       % TODO: check if the type is known
       Artifacts = grailbag_reg:list(Type),
       Reply = encode_list(Artifacts),
-      gen_tcp:send(Socket, Reply),
-      {noreply, State};
+      case gen_tcp:send(Socket, Reply) of
+        ok ->
+          inet:setopts(Socket, [{active, once}]),
+          {noreply, State};
+        {error, _} ->
+          {stop, normal, State}
+      end;
     % TODO: `{watch, Type, ...}' (long running)
     {info, ID} ->
       Reply = case grailbag_reg:info(ID) of
         {ok, Info} -> encode_info(Info);
         undefined -> encode_error(unknown_artifact)
       end,
-      gen_tcp:send(Socket, Reply),
-      {noreply, State};
+      case gen_tcp:send(Socket, Reply) of
+        ok ->
+          inet:setopts(Socket, [{active, once}]),
+          {noreply, State};
+        {error, _} ->
+          {stop, normal, State}
+      end;
     {get, ID} -> % potentially long running connection
-      % TODO: grailbag_artifact:open(ID),
-      %       grailbag_artifact:info(),
-      %       grailbag_artifact:read()
-      Reply = case grailbag_reg:info(ID) of
-        {ok, Info} -> encode_info(Info);
-        undefined -> encode_error(unknown_artifact)
+      case grailbag_artifact:open(ID) of
+        {ok, Handle} ->
+          {ok, Info} = grailbag_artifact:info(Handle),
+          RawReply = encode_info(Info),
+          % we won't be reading for a while, and sending should not add any
+          % data (`{packet,4}' adds 4 bytes of packet length)
+          inet:setopts(Socket, [{packet, raw}]),
+          Reply = [<<(iolist_size(RawReply)):32>>, RawReply],
+          NewState = State#state{handle = {download, ID, Handle}};
+        {error, bad_id} ->
+          inet:setopts(Socket, [{active, once}]),
+          Reply = encode_error(unknown_artifact),
+          NewState = State;
+        {error, _Reason} ->
+          inet:setopts(Socket, [{active, once}]),
+          % TODO: log this error
+          Reply = encode_error({server_error, ?EVENT_ID_TODO}),
+          NewState = State
       end,
-      gen_tcp:send(Socket, Reply),
-      {noreply, State};
+      case gen_tcp:send(Socket, Reply) of
+        ok ->
+          % go into timeout->read->send->timeout loop
+          {noreply, NewState, 0};
+        {error, _} ->
+          {stop, normal, NewState}
+      end;
     {error, badarg} ->
       % protocol error
       {stop, normal, State}
@@ -196,7 +279,7 @@ handle_info({tcp_error, Socket, Reason} = _Message,
 
 %% unknown messages
 handle_info(_Message, State) ->
-  {noreply, State}.
+  {noreply, State, 0}.
 
 %% }}}
 %%----------------------------------------------------------
