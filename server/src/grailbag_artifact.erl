@@ -56,6 +56,7 @@
   metadata :: {grailbag:artifact_id(), grailbag:artifact_type(),
                 [{grailbag:tag(), grailbag:tag_value()}]},
   body :: file:fd() | undefined,
+  size :: non_neg_integer(),
   hash :: binary() | undefined
 }).
 
@@ -274,7 +275,7 @@ read(_Handle = #artifact{fh = FH}, Size) ->
 %%
 %% @see open/1
 
--spec info(Object :: grailbag:artifact_id() | read_handle()) ->
+-spec info(Object :: grailbag:artifact_id() | read_handle() | write_handle()) ->
   {ok, grailbag:artifact_info()} | undefined.
 
 info(ID) when is_binary(ID) ->
@@ -283,6 +284,8 @@ info(ID) when is_binary(ID) ->
     {ok, ArtifactInfo} -> {ok, ArtifactInfo};
     {error, _} -> undefined
   end;
+info(Handle) when is_pid(Handle) ->
+  gen_server:call(Handle, info, infinity);
 info(_Handle = #artifact{info = ArtifactInfo}) ->
   {ok, ArtifactInfo}.
 
@@ -381,6 +384,7 @@ init([Owner, ID, Path, Type, Tags] = _Args) ->
         path = Path,
         metadata = {ID, Type, Tags},
         body = FH,
+        size = 0,
         hash = hash_init()
       },
       {ok, State};
@@ -414,11 +418,14 @@ handle_call({write, _Data} = _Request, _From,
             State = #state{body = undefined}) ->
   {reply, {error, ebadf}, State};
 handle_call({write, Data} = _Request, _From,
-            State = #state{body = FH, hash = HashContext}) ->
+            State = #state{body = FH, size = Size, hash = HashContext}) ->
   case file:write(FH, Data) of
     ok ->
       NewHashContext = hash_update(HashContext, Data),
-      NewState = State#state{hash = NewHashContext},
+      NewState = State#state{
+        size = Size + size(Data),
+        hash = NewHashContext
+      },
       {reply, ok, NewState};
     {error, Reason} ->
       file:close(FH),
@@ -428,6 +435,15 @@ handle_call({write, Data} = _Request, _From,
       },
       {reply, {error, Reason}, NewState}
   end;
+
+handle_call(info = _Request, _From,
+            State = #state{body = undefined, size = Size, hash = Hash,
+                           metadata = {ID, Type, Tags}})
+when is_binary(Hash) ->
+  ArtifactInfo = {ID, Type, Size, Hash, Tags, []},
+  {reply, {ok, ArtifactInfo}, State};
+handle_call(info = _Request, _From, State) ->
+  {reply, {error, ebadfd}, State};
 
 handle_call(finish = _Request, _From,
             State = #state{hash = undefined}) ->

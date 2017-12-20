@@ -30,6 +30,7 @@
 -record(state, {
   socket :: gen_tcp:socket(),
   read_left :: undefined | grailbag:file_size(),
+  upload_hash :: undefined | grailbag:body_hash(),
   handle :: undefined
           | {upload, grailbag:artifact_id(), grailbag_artifact:write_handle()}
           | {download, grailbag:artifact_id(), grailbag_artifact:read_handle()}
@@ -97,6 +98,8 @@ init([Socket] = _Args) ->
   grailbag_log:info("new connection"),
   State = #state{
     socket = Socket,
+    read_left = undefined,
+    upload_hash = undefined,
     handle = undefined
   },
   {ok, State}.
@@ -180,16 +183,79 @@ handle_info(timeout = _Message,
   end;
 
 handle_info({tcp, Socket, Data} = _Message,
+            State = #state{socket = Socket, upload_hash = LocalHash,
+                           handle = {upload, ID, Handle}}) ->
+  if
+    LocalHash == undefined, size(Data) > 0 ->
+      % another body chunk
+      case grailbag_artifact:write(Handle, Data) of
+        ok ->
+          inet:setopts(Socket, [{active, once}]),
+          {noreply, State};
+        {error, Reason} ->
+          grailbag_log:warn("artifact write error",
+                            [{artifact, ID}, {error, {term, Reason}}]),
+          {stop, normal, State}
+      end;
+    LocalHash == undefined, size(Data) == 0 ->
+      % end-of-body marker
+      {ok, Hash} = grailbag_artifact:finish(Handle),
+      % FIXME: if the server crashes now, the unverified artifact will be kept
+      % in the storage (though data corruption during transfer is a rare
+      % event, so it shouldn't be a major problem)
+      NewState = State#state{upload_hash = Hash},
+      inet:setopts(Socket, [{active, once}]),
+      {noreply, NewState};
+    is_binary(LocalHash) ->
+      % hash sent after end-of-body marker
+      {ok, {_, Type, Size, _Hash, Tags, []}} = grailbag_artifact:info(Handle),
+      grailbag_artifact:close(Handle),
+      NewState = State#state{
+        upload_hash = undefined,
+        handle = undefined
+      },
+      Reply = case (Data == LocalHash) of
+        true ->
+          grailbag_reg:store(ID, Type, Size, LocalHash, Tags),
+          encode_success(ID);
+        false ->
+          grailbag_artifact:delete(ID), % let's hope that delete succeeds
+          encode_error(body_checksum_mismatch)
+      end,
+      case gen_tcp:send(Socket, Reply) of
+        ok ->
+          inet:setopts(Socket, [{active, once}]),
+          {noreply, NewState};
+        {error, _Reason} ->
+          % TODO: log this error
+          {stop, normal, NewState}
+      end
+  end;
+
+handle_info({tcp, Socket, Data} = _Message,
             State = #state{socket = Socket, handle = undefined}) ->
   case decode_request(Data) of
-    {store, _Type, _Tags} -> % long running connection
-      % TODO: grailbag_artifact:create(Type, Tags) ->
-      %       grailbag_artifact:write() ->
-      %       grailbag_artifact:finish() ->
-      %       grailbag_reg:store()
-      Reply = encode_error({server_error, ?EVENT_ID_UNIMPLEMENTED}),
-      gen_tcp:send(Socket, Reply),
-      {stop, normal, State};
+    {store, Type, Tags} -> % long running connection
+      % TODO: check if the type is known
+      case grailbag_artifact:create(Type, Tags) of
+        {ok, Handle, ID} ->
+          % NOTE: socket is and stays in passive state and 4-byte size prefix
+          % packet mode
+          % TODO: send allowed chunk size to the client
+          Reply = encode_success(ID),
+          NewState = State#state{handle = {upload, ID, Handle}};
+        {error, _Reason} ->
+          % TODO: log this error
+          Reply = encode_error({server_error, ?EVENT_ID_TODO}),
+          NewState = State
+      end,
+      case gen_tcp:send(Socket, Reply) of
+        ok ->
+          inet:setopts(Socket, [{active, once}]),
+          {noreply, NewState};
+        {error, _} ->
+          {stop, normal, NewState}
+      end;
     {delete, ID} ->
       Reply = case grailbag_reg:delete(ID) of
         ok -> encode_success(ID);
