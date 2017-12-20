@@ -25,8 +25,11 @@
 -define(EVENT_ID_TODO, <<0:128>>).
 -define(EVENT_ID_UNIMPLEMENTED, <<16#ffffffffffffffff:64, 16#ffffffffffffffff:64>>).
 
+-define(READ_CHUNK_SIZE, 16384). % 16kB
+
 -record(state, {
   socket :: gen_tcp:socket(),
+  read_left :: undefined | grailbag:file_size(),
   handle :: undefined
           | {upload, grailbag:artifact_id(), grailbag_artifact:write_handle()}
           | {download, grailbag:artifact_id(), grailbag_artifact:read_handle()}
@@ -140,30 +143,39 @@ handle_info(timeout = _Message,
   {noreply, State};
 
 handle_info(timeout = _Message,
-            State = #state{socket = Socket, handle = {download, ID, Handle}}) ->
+            State = #state{socket = Socket, read_left = 0,
+                           handle = {download, _ID, Handle}}) ->
+  % artifact read and sent in the whole; go back to reading 4-byte
+  % size-prefixed requests
+  grailbag_artifact:close(Handle),
+  inet:setopts(Socket, [{active, once}, {packet, 4}]),
+  NewState = State#state{
+    read_left = undefined,
+    handle = undefined
+  },
+  {noreply, NewState};
+
+handle_info(timeout = _Message,
+            State = #state{socket = Socket, read_left = ReadLeft,
+                           handle = {download, ID, Handle}}) ->
   % timeout->read->send->timeout loop
-  case grailbag_artifact:read(Handle, 16 * 1024) of
+  case grailbag_artifact:read(Handle, min(ReadLeft, 16 * 1024)) of
     {ok, Data} ->
       case gen_tcp:send(Socket, Data) of
         ok ->
-          {noreply, State, 0};
+          NewState = State#state{read_left = ReadLeft - size(Data)},
+          {noreply, NewState, 0};
         {error, Reason} ->
           grailbag_log:info("TCP send error", [{error, {term, Reason}}]),
           {stop, normal, State}
       end;
     eof ->
-      % TODO: check if the amount of data read/sent equals to what was
-      % reported to the client
-      grailbag_artifact:close(Handle),
-      % go back to (a) reading with (b) 4-byte size prefix
-      inet:setopts(Socket, [{active, once}, {packet, 4}]),
-      NewState = State#state{handle = undefined},
-      {noreply, NewState};
+      grailbag_log:warn("artifact read error",
+                        [{artifact, ID}, {error, {term, eof}}]),
+      {stop, normal, State};
     {error, Reason} ->
-      grailbag_log:warn("artifact read error", [
-        {artifact, ID},
-        {error, {term, Reason}}
-      ]),
+      grailbag_log:warn("artifact read error",
+                        [{artifact, ID}, {error, {term, Reason}}]),
       {stop, normal, State}
   end;
 
@@ -239,13 +251,17 @@ handle_info({tcp, Socket, Data} = _Message,
     {get, ID} -> % potentially long running connection
       case grailbag_artifact:open(ID) of
         {ok, Handle} ->
-          {ok, Info} = grailbag_artifact:info(Handle),
+          {ok, {_ID, _Type, FileSize, _Hash, _Tags, _Tokens} = Info} =
+            grailbag_artifact:info(Handle),
           RawReply = encode_info(Info),
           % we won't be reading for a while, and sending should not add any
           % data (`{packet,4}' adds 4 bytes of packet length)
           inet:setopts(Socket, [{packet, raw}]),
           Reply = [<<(iolist_size(RawReply)):32>>, RawReply],
-          NewState = State#state{handle = {download, ID, Handle}};
+          NewState = State#state{
+            read_left = FileSize,
+            handle = {download, ID, Handle}
+          };
         {error, bad_id} ->
           inet:setopts(Socket, [{active, once}]),
           Reply = encode_error(unknown_artifact),
