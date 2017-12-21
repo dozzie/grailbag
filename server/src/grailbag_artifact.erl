@@ -171,6 +171,7 @@ finish(Handle) ->
                   [{grailbag:tag(), grailbag:tag_value()}]) ->
   ok | {error, Reason}
   when Reason :: {schema, Dup :: [grailbag:tag()], Missing :: [grailbag:tag()]}
+               | checksum
                | term().
 
 update_tags(ID, Tags) ->
@@ -206,6 +207,7 @@ update_tags(ID, Tags) ->
 -spec update_tokens(grailbag:artifact_id(), [grailbag:token()]) ->
   ok | {error, Reason}
   when Reason :: {schema, Unknown :: [grailbag:token()]}
+               | checksum
                | term().
 
 update_tokens(ID, Tokens) ->
@@ -237,7 +239,7 @@ update_tokens(ID, Tokens) ->
 -spec open(grailbag:artifact_id()) ->
   {ok, read_handle()} | {error, bad_id | Reason}
   when Reason :: {body, file:posix()}
-               | {metadata, format | file:posix()}.
+               | {metadata, format | checksum | file:posix()}.
 
 open(ID) ->
   Path = artifact_dir(ID),
@@ -250,6 +252,9 @@ open(ID) ->
             info = ArtifactInfo
           },
           {ok, Handle};
+        {error, checksum} ->
+          file:close(FH),
+          {error, {metadata, checksum}};
         {error, badarg} ->
           file:close(FH),
           {error, {metadata, format}};
@@ -468,9 +473,8 @@ handle_call(finish = _Request, _From,
   Hash = hash_final(HashContext),
   % TODO: write `filename:join(Path, ?SCHEMA_FILE)'
   % TODO: handle write errors
-  ok = file:write_file(filename:join(Path, ?METADATA_FILE),
-                       encode_info(ID, Type, FileSize, Hash, CTime, MTime,
-                                   Tags, [])),
+  ok = encode_info_file(filename:join(Path, ?METADATA_FILE),
+                        ID, Type, FileSize, Hash, CTime, MTime, Tags, []),
   NewState = State#state{
     body = undefined,
     hash = Hash
@@ -528,7 +532,7 @@ hash_init() ->
 
 %% @doc Update hash calculation context with more data.
 
--spec hash_update(binary(), binary()) ->
+-spec hash_update(binary(), binary() | iolist()) ->
   Context :: binary().
 
 hash_update(Context, Data) ->
@@ -541,6 +545,14 @@ hash_update(Context, Data) ->
 
 hash_final(Context) ->
   crypto:sha_final(Context).
+
+%% @doc Calculate hash of data in one go.
+
+-spec hash(binary() | iolist()) ->
+  Hash :: binary().
+
+hash(Data) ->
+  hash_final(hash_update(hash_init(), Data)).
 
 %%%---------------------------------------------------------------------------
 %%% encoding/decoding artifact metadata
@@ -560,7 +572,8 @@ hash_final(Context) ->
 
 encode_info_file(File, ID, Type, Size, Hash, CTime, MTime, Tags, Tokens) ->
   Data = encode_info(ID, Type, Size, Hash, CTime, MTime, Tags, Tokens),
-  file:write_file(File, Data).
+  DataHash = hash(Data),
+  file:write_file(File, [Data, DataHash, <<(size(DataHash)):16>>]).
 
 %% @doc Encode metadata for writing to artifact's info file.
 %%
@@ -615,14 +628,26 @@ encode_token(Token) ->
 %% @see decode_info/1
 
 -spec decode_info_file(file:filename()) ->
-  {ok, grailbag:artifact_info()} | {error, badarg | file:posix()}.
+  {ok, grailbag:artifact_info()} | {error, badarg | checksum | file:posix()}.
 
 decode_info_file(File) ->
   % the file, even accounting for tags, should be small, especially that all
   % the information is supposed to also be kept in ETS table
   case file:read_file(File) of
-    {ok, Data} -> decode_info(Data);
-    {error, Reason} -> {error, Reason}
+    {ok, HashedData} ->
+      try
+        <<HLen:16>> = binary:part(HashedData, size(HashedData), -2),
+        DataHash = binary:part(HashedData, size(HashedData) - 2, -HLen),
+        Data = binary:part(HashedData, 0, size(HashedData) - 2 - HLen),
+        case (hash(Data) == DataHash) of
+          true -> decode_info(Data);
+          false -> {error, checksum}
+        end
+      catch
+        _:_ -> {error, checksum}
+      end;
+    {error, Reason} ->
+      {error, Reason}
   end.
 
 %% @doc Decode metadata from content of artifact's info file.
