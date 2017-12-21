@@ -55,6 +55,7 @@
   path :: file:filename(),
   metadata :: {grailbag:artifact_id(), grailbag:artifact_type(),
                 [{grailbag:tag(), grailbag:tag_value()}]},
+  time :: grailbag:timestamp(),
   body :: file:fd() | undefined,
   size :: non_neg_integer(),
   hash :: binary() | undefined
@@ -178,8 +179,10 @@ update_tags(ID, Tags) ->
   NewFile = filename:join(Path, ?METADATA_UPDATE_FILE),
   case decode_info_file(OldFile) of
     % TODO: return error on mismatching ID
-    {ok, {_ID, Type, Size, Hash, _OldTags, Tokens}} ->
-      case encode_info_file(NewFile, ID, Type, Size, Hash, Tags, Tokens) of
+    {ok, {_ID, Type, Size, Hash, CTime, _OldMTime, _OldTags, Tokens}} ->
+      MTime = grailbag:timestamp(),
+      case encode_info_file(NewFile, ID, Type, Size, Hash, CTime, MTime,
+                            Tags, Tokens) of
         ok ->
           file:rename(NewFile, OldFile);
         {error, Reason} ->
@@ -211,8 +214,10 @@ update_tokens(ID, Tokens) ->
   NewFile = filename:join(Path, ?METADATA_UPDATE_FILE),
   case decode_info_file(OldFile) of
     % TODO: return error on mismatching ID
-    {ok, {_ID, Type, Size, Hash, Tags, _OldTokens}} ->
-      case encode_info_file(NewFile, ID, Type, Size, Hash, Tags, Tokens) of
+    {ok, {_ID, Type, Size, Hash, CTime, _OldMTime, Tags, _OldTokens}} ->
+      MTime = grailbag:timestamp(),
+      case encode_info_file(NewFile, ID, Type, Size, Hash, CTime, MTime,
+                            Tags, Tokens) of
         ok ->
           file:rename(NewFile, OldFile);
         {error, Reason} ->
@@ -383,6 +388,7 @@ init([Owner, ID, Path, Type, Tags] = _Args) ->
         owner = {Owner, Ref},
         path = Path,
         metadata = {ID, Type, Tags},
+        time = grailbag:timestamp(),
         body = FH,
         size = 0,
         hash = hash_init()
@@ -438,9 +444,9 @@ handle_call({write, Data} = _Request, _From,
 
 handle_call(info = _Request, _From,
             State = #state{body = undefined, size = Size, hash = Hash,
-                           metadata = {ID, Type, Tags}})
+                           time = CTime = MTime, metadata = {ID, Type, Tags}})
 when is_binary(Hash) ->
-  ArtifactInfo = {ID, Type, Size, Hash, Tags, []},
+  ArtifactInfo = {ID, Type, Size, Hash, CTime, MTime, Tags, []},
   {reply, {ok, ArtifactInfo}, State};
 handle_call(info = _Request, _From, State) ->
   {reply, {error, ebadfd}, State};
@@ -453,6 +459,7 @@ handle_call(finish = _Request, _From,
   {reply, {ok, Hash}, State};
 handle_call(finish = _Request, _From,
             State = #state{path = Path, body = FH, hash = HashContext,
+                           time = CTime = MTime, 
                            metadata = {ID, Type, Tags}}) ->
   {ok, FileSize} = file:position(FH, cur),
   file:close(FH),
@@ -462,7 +469,8 @@ handle_call(finish = _Request, _From,
   % TODO: write `filename:join(Path, ?SCHEMA_FILE)'
   % TODO: handle write errors
   ok = file:write_file(filename:join(Path, ?METADATA_FILE),
-                       encode_info(ID, Type, FileSize, Hash, Tags, [])),
+                       encode_info(ID, Type, FileSize, Hash, CTime, MTime,
+                                   Tags, [])),
   NewState = State#state{
     body = undefined,
     hash = Hash
@@ -540,17 +548,18 @@ hash_final(Context) ->
 %% @doc Encode metadata and write it to artifact's info file.
 %%
 %% @see decode_info_file/1
-%% @see encode_info/5
+%% @see encode_info/7
 
 -spec encode_info_file(file:filename(),
                        grailbag:artifact_id(), grailbag:artifact_type(),
                        grailbag:file_size(), grailbag:body_hash(),
+                       grailbag:ctime(), grailbag:mtime(),
                        [{grailbag:tag(), grailbag:tag_value()}],
                        [grailbag:token()]) ->
   ok | {error, file:posix()}.
 
-encode_info_file(File, ID, Type, Size, Hash, Tags, Tokens) ->
-  Data = encode_info(ID, Type, Size, Hash, Tags, Tokens),
+encode_info_file(File, ID, Type, Size, Hash, CTime, MTime, Tags, Tokens) ->
+  Data = encode_info(ID, Type, Size, Hash, CTime, MTime, Tags, Tokens),
   file:write_file(File, Data).
 
 %% @doc Encode metadata for writing to artifact's info file.
@@ -560,18 +569,18 @@ encode_info_file(File, ID, Type, Size, Hash, Tags, Tokens) ->
 
 -spec encode_info(grailbag:artifact_id(), grailbag:artifact_type(),
                   grailbag:file_size(), grailbag:body_hash(),
+                  grailbag:ctime(), grailbag:mtime(),
                   [{grailbag:tag(), grailbag:tag_value()}],
                   [grailbag:token()]) ->
   iolist().
 
-encode_info(ID, Type, Size, Hash, Tags, Tokens) ->
-  % TODO: add a checksum of this info
-  % TODO: add upload time
+encode_info(ID, Type, Size, Hash, CTime, MTime, Tags, Tokens) ->
   _Result = [
     grailbag_uuid:parse(binary_to_list(ID)),
     <<(size(Type)):16>>, Type,
     <<Size:64>>,
     <<(size(Hash)):16>>, Hash,
+    <<CTime:64, MTime:64>>,
     <<(length(Tags)):32>>,
     <<(length(Tokens)):32>>,
     [encode_tag(Tag, Value) || {Tag, Value} <- Tags],
@@ -580,7 +589,7 @@ encode_info(ID, Type, Size, Hash, Tags, Tokens) ->
 
 %% @doc Encode a tag with its value.
 %%
-%% @see encode_info/5
+%% @see encode_info/7
 
 -spec encode_tag(grailbag:tag(), grailbag:tag_value()) ->
   iolist().
@@ -592,7 +601,7 @@ encode_tag(Tag, Value) ->
 
 %% @doc Encode a token name.
 %%
-%% @see encode_info/5
+%% @see encode_info/7
 
 -spec encode_token(grailbag:token()) ->
   iolist().
@@ -618,7 +627,7 @@ decode_info_file(File) ->
 
 %% @doc Decode metadata from content of artifact's info file.
 %%
-%% @see encode_info/5
+%% @see encode_info/7
 %% @see decode_info_file/1
 
 -spec decode_info(binary()) ->
@@ -627,14 +636,14 @@ decode_info_file(File) ->
 decode_info(Data) ->
   case Data of
     <<UUID:16/binary, TypeLen:16, Type:TypeLen/binary,
-      FileSize:64, HLen:16, Hash:HLen/binary, NTags:32, NTokens:32,
-      TagsTokensData/binary>> ->
+      FileSize:64, HLen:16, Hash:HLen/binary, CTime:64, MTime:64,
+      NTags:32, NTokens:32, TagsTokensData/binary>> ->
       ID = list_to_binary(grailbag_uuid:format(UUID)),
       try
         {Tags, TokensData} = decode_tags(NTags, [], TagsTokensData),
         {Tokens, <<>>} = decode_tokens(NTokens, [], TokensData),
-        ArtifactInfo =
-          {ID, binary:copy(Type), FileSize, binary:copy(Hash), Tags, Tokens},
+        ArtifactInfo = {ID, binary:copy(Type), FileSize, binary:copy(Hash),
+                         CTime, MTime, Tags, Tokens},
         {ok, ArtifactInfo}
       catch
         _:_ ->

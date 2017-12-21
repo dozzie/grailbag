@@ -208,7 +208,8 @@ handle_info({tcp, Socket, Data} = _Message,
       {noreply, NewState};
     is_binary(LocalHash) ->
       % hash sent after end-of-body marker
-      {ok, {_, Type, Size, _Hash, Tags, []}} = grailbag_artifact:info(Handle),
+      {ok, {_, Type, Size, _Hash, CTime, MTime, Tags, []}} =
+        grailbag_artifact:info(Handle),
       grailbag_artifact:close(Handle),
       NewState = State#state{
         upload_hash = undefined,
@@ -216,7 +217,7 @@ handle_info({tcp, Socket, Data} = _Message,
       },
       Reply = case (Data == LocalHash) of
         true ->
-          grailbag_reg:store(ID, Type, Size, LocalHash, Tags),
+          grailbag_reg:store(ID, Type, Size, LocalHash, CTime, MTime, Tags),
           encode_success(ID);
         false ->
           grailbag_artifact:delete(ID), % let's hope that delete succeeds
@@ -317,7 +318,7 @@ handle_info({tcp, Socket, Data} = _Message,
     {get, ID} -> % potentially long running connection
       case grailbag_artifact:open(ID) of
         {ok, Handle} ->
-          {ok, {_ID, _Type, FileSize, _Hash, _Tags, _Tokens} = Info} =
+          {ok, {_ID, _Type, FileSize, _Hash, _CTime, _MTime, _Tags, _Tokens} = Info} =
             grailbag_artifact:info(Handle),
           RawReply = encode_info(Info),
           % we won't be reading for a while, and sending should not add any
@@ -419,12 +420,13 @@ encode_list(Artifacts) ->
 -spec encode_artifact_info(grailbag:artifact_info()) ->
   iolist().
 
-encode_artifact_info({ID, Type, FileSize, Hash, Tags, Tokens} = _Info) ->
+encode_artifact_info({ID, Type, FileSize, Hash, CTime, MTime, Tags, Tokens} = _Info) ->
   _Result = [
     grailbag_uuid:parse(binary_to_list(ID)),
     <<(size(Type)):16>>, Type,
     <<FileSize:64>>,
     <<(size(Hash)):16>>, Hash,
+    <<CTime:64, MTime:64>>,
     <<(length(Tags)):32>>,
     <<(length(Tokens)):32>>,
     [encode_tag(Tag, Value) || {Tag, Value} <- Tags],

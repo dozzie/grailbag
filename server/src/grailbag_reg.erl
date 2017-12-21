@@ -12,7 +12,7 @@
 -behaviour(gen_server).
 
 %% public interface
--export([store/5, delete/1]).
+-export([store/7, delete/1]).
 -export([list/1, info/1]).
 
 %% supervision tree API
@@ -34,6 +34,8 @@
   type :: grailbag:artifact_type(),
   body_size :: non_neg_integer(),
   body_hash :: grailbag:body_hash(),
+  ctime :: grailbag:ctime(),
+  mtime :: grailbag:mtime(),
   tags :: [{grailbag:tag(), grailbag:tag_value()}],
   tokens :: [grailbag:token()]
 }).
@@ -53,12 +55,13 @@
 %% @see grailbag_artifact:finish/1
 
 -spec store(grailbag:artifact_id(), grailbag:artifact_type(), non_neg_integer(),
-            grailbag:body_hash(), [{grailbag:tag(), grailbag:tag_value()}]) ->
+            grailbag:body_hash(), grailbag:ctime(), grailbag:mtime(),
+            [{grailbag:tag(), grailbag:tag_value()}]) ->
   ok | {error, duplicate_id}.
 
-store(ID, Type, BodySize, BodyHash, Tags) ->
-  gen_server:call(?MODULE, {store, {ID, Type, BodySize, BodyHash, Tags, []}},
-                  infinity).
+store(ID, Type, BodySize, BodyHash, CTime, MTime, Tags) ->
+  ArtifactInfo = {ID, Type, BodySize, BodyHash, CTime, MTime, Tags, []},
+  gen_server:call(?MODULE, {store, ArtifactInfo}, infinity).
 
 %% @doc Delete an artifact from memory and from disk.
 
@@ -100,8 +103,8 @@ add_artifact_info({_, ID}, Artifacts) ->
 info(ID) ->
   case ets:lookup(?ARTIFACT_TABLE, ID) of
     [#artifact{type = Type, body_size = Size, body_hash = Hash,
-               tags = Tags, tokens = Tokens}] ->
-      {ok, {ID, Type, Size, Hash, Tags, Tokens}};
+               ctime = CTime, mtime = MTime, tags = Tags, tokens = Tokens}] ->
+      {ok, {ID, Type, Size, Hash, CTime, MTime, Tags, Tokens}};
     [] ->
       undefined
   end.
@@ -140,8 +143,8 @@ init(_Args) ->
   lists:foldl(
     fun(ID, Acc) ->
       case grailbag_artifact:info(ID) of
-        {ok, {ID, Type, _Size, _Hash, _Tags, _Tokens} = ArtifactInfo} ->
-          ets:insert(?ARTIFACT_TABLE, make_record(ArtifactInfo)),
+        {ok, {ID, Type, _Size, _Hash, _CTime, _MTime, _Tags, _Tokens} = Info} ->
+          ets:insert(?ARTIFACT_TABLE, make_record(Info)),
           ets:insert(?TYPE_TABLE, {Type, ID}),
           Acc;
         undefined ->
@@ -172,7 +175,7 @@ terminate(_Arg, _State) ->
 %% @private
 %% @doc Handle {@link gen_server:call/2}.
 
-handle_call({store, {ID, Type, _Size, _Hash, _Tags, []} = Info} = _Request,
+handle_call({store, {ID, Type, _Size, _Hash, _CTime, _MTime, _Tags, []} = Info} = _Request,
             _From, State) ->
   case ets:insert_new(?ARTIFACT_TABLE, make_record(Info)) of
     true ->
@@ -232,12 +235,14 @@ code_change(_OldVsn, State, _Extra) ->
 -spec make_record(grailbag:artifact_info()) ->
   #artifact{}.
 
-make_record({ID, Type, Size, Hash, Tags, Tokens} = _Info) ->
+make_record({ID, Type, Size, Hash, CTime, MTime, Tags, Tokens} = _Info) ->
   #artifact{
     id = ID,
     type = Type,
     body_size = Size,
     body_hash = Hash,
+    ctime = CTime,
+    mtime = MTime,
     tags = Tags,
     tokens = Tokens
   }.
