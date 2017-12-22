@@ -31,6 +31,8 @@
 
 -define(ARTIFACT_TABLE, grailbag_artifacts).
 -define(TYPE_TABLE, grailbag_artifact_types).
+% NOTE: mtime field in this table is only used during boot
+-define(TOKEN_TABLE, grailbag_artifact_tokens).
 
 -record(artifact, {
   id :: grailbag:artifact_id(),
@@ -167,6 +169,8 @@ init(_Args) ->
   ets:new(?ARTIFACT_TABLE,
           [set, named_table, protected, {keypos, #artifact.id}]),
   ets:new(?TYPE_TABLE, [bag, named_table, protected]),
+  % `{{Type,Token}, ID, MTime}'
+  ets:new(?TOKEN_TABLE, [set, named_table, protected]),
   lists:foreach(fun ets_add_artifact/1, grailbag_artifact:list()),
   grailbag_log:info("starting artifact registry", [
     {artifacts, ets:info(?ARTIFACT_TABLE, size)}
@@ -174,14 +178,57 @@ init(_Args) ->
   State = #state{},
   {ok, State}.
 
+%% @doc Helper to add an artifact to ETS tables during boot ({@link init/1}).
+
+-spec ets_add_artifact(grailbag:artifact_id()) ->
+  any().
+
 ets_add_artifact(ID) ->
   case grailbag_artifact:info(ID) of
-    {ok, {ID, Type, _Size, _Hash, _CTime, _MTime, _Tags, _Tokens} = Info} ->
-      ets:insert(?ARTIFACT_TABLE, make_record(Info)),
+    {ok, {ID, Type, Size, Hash, CTime, MTime, Tags, Tokens}} ->
+      % TODO: filter unique tags
+      NewTokens = filter_duplicate_tokens(Type, ID, MTime, Tokens),
+      ets:insert(?TOKEN_TABLE, [{{Type, T}, ID, MTime} || T <- NewTokens]),
+      NewInfo = {ID, Type, Size, Hash, CTime, MTime, Tags, NewTokens},
+      ets:insert(?ARTIFACT_TABLE, make_record(NewInfo)),
       ets:insert(?TYPE_TABLE, {Type, ID});
     undefined ->
       ok
   end.
+
+%% @doc {@link ets_add_artifact/1} helper to keep duplicates off of ETS tokens
+%%   table.
+
+-spec filter_duplicate_tokens(grailbag:artifact_type(), grailbag:artifact_id(),
+                              grailbag:mtime(), [grailbag:token()]) ->
+  [grailbag:token()].
+
+filter_duplicate_tokens(_Type, _ID, _MTime, [] = _Tokens) ->
+  [];
+filter_duplicate_tokens(Type, ID, MTime, [T | Rest] = _Tokens) ->
+  case ets:lookup(?TOKEN_TABLE, {Type, T}) of
+    [] ->
+      [T | filter_duplicate_tokens(Type, ID, MTime, Rest)];
+    % XXX: the clauses below are only relevant when a crash occurred during
+    % moving a token
+    [{{Type, T}, OtherID, OtherMTime}] when OtherMTime < MTime ->
+      ets_remove_token(OtherID, T),
+      [T | filter_duplicate_tokens(Type, ID, MTime, Rest)];
+    [{{Type, T}, _OtherID, OtherMTime}] when OtherMTime >= MTime ->
+      filter_duplicate_tokens(Type, ID, MTime, Rest)
+  end.
+
+%% @doc {@link filter_duplicate_tokens/3} helper to remove duplicate tokens
+%%   from an artifact record in ETS table.
+
+-spec ets_remove_token(grailbag:artifact_id(), grailbag:token()) ->
+  any().
+
+ets_remove_token(ID, Token) ->
+  [#artifact{tokens = Tokens} = Record] = ets:lookup(?ARTIFACT_TABLE, ID),
+  NewTokens = lists:delete(Token, Tokens),
+  NewRecord = Record#artifact{tokens = NewTokens},
+  ets:insert(?ARTIFACT_TABLE, NewRecord).
 
 %% @private
 %% @doc Clean up {@link gen_server} state.
@@ -189,6 +236,7 @@ ets_add_artifact(ID) ->
 terminate(_Arg, _State) ->
   ets:delete(?ARTIFACT_TABLE),
   ets:delete(?TYPE_TABLE),
+  ets:delete(?TOKEN_TABLE),
   ok.
 
 %% }}}
@@ -260,9 +308,8 @@ handle_call({update_tags, ID, SetTags, UnsetTags} = _Request, _From,
 
 handle_call({update_tokens, ID, SetTokens, UnsetTokens} = _Request, _From,
             State) ->
-  % TODO: move tags from another artifact, if applicable
   case ets:lookup(?ARTIFACT_TABLE, ID) of
-    [#artifact{tokens = OldTokens} = Record] ->
+    [#artifact{type = Type, tokens = OldTokens} = Record] ->
       FilterSet = sets:from_list(UnsetTokens),
       NewTokens = lists:usort(
         SetTokens ++
@@ -276,6 +323,20 @@ handle_call({update_tokens, ID, SetTokens, UnsetTokens} = _Request, _From,
             tokens = NewTokens
           },
           ets:insert(?ARTIFACT_TABLE, NewRecord),
+          % delete the unset tokens from the ETS tokens table
+          lists:foreach(
+            fun(T) ->
+              case ets:lookup(?TOKEN_TABLE, {Type, T}) of
+                [{_, ID, _}] -> ets:delete(?TOKEN_TABLE, {Type, T});
+                _ -> ok % either no entry or not this ID
+              end
+            end,
+            UnsetTokens
+          ),
+          % remove tokens set to this artifact from the artifacts that kept
+          % them previously, both in ETS table and on disk
+          % TODO: handle storage write errors
+          ok = move_tokens(ID, Type, SetTokens),
           {reply, ok, State};
         {error, _Reason} ->
           % TODO: log this error and return correlation ID
@@ -315,6 +376,52 @@ code_change(_OldVsn, State, _Extra) ->
 
 %% }}}
 %%----------------------------------------------------------
+
+%%%---------------------------------------------------------------------------
+
+%% @doc Move tokens that are being set from their previous owners, both
+%%   on-disk and in-memory.
+%%
+%% @todo Don't crash on disk write errors and report them
+
+-spec move_tokens(grailbag:artifact_id(), grailbag:artifact_type(),
+                  [grailbag:token()]) ->
+  ok.
+
+move_tokens(NewID, Type, Tokens) ->
+  % find all artifacts that are affected by moving tokens
+  UpdateArtifacts = lists:usort(lists:foldl(
+    fun(T, Acc) ->
+      case ets:lookup(?TOKEN_TABLE, {Type, T}) of
+        [{_, OldID, _MTime}] when OldID /= NewID -> [OldID | Acc];
+        _ -> Acc
+      end
+    end,
+    [],
+    Tokens
+  )),
+  % NOTE: `MTime' field in ETS tokens table is not used after boot
+  ets:insert(?TOKEN_TABLE, [{{Type, T}, NewID, undefined} || T <- Tokens]),
+  UnsetTokens = sets:from_list(Tokens),
+  lists:foreach(
+    fun(ID) ->
+      [Record] = ets:lookup(?ARTIFACT_TABLE, ID),
+      NewTokens = lists:filter(
+        fun(T) -> not sets:is_element(T, UnsetTokens) end,
+        Record#artifact.tokens
+      ),
+      % TODO: handle write errors
+      {ok, MTime} = grailbag_artifact:update_tokens(ID, NewTokens),
+      NewRecord = Record#artifact{
+        mtime = MTime,
+        tokens = NewTokens
+      },
+      ets:insert(?ARTIFACT_TABLE, NewRecord)
+    end,
+    UpdateArtifacts
+  ),
+  % TODO: report write errors
+  ok.
 
 %%%---------------------------------------------------------------------------
 
