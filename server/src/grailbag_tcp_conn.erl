@@ -271,9 +271,13 @@ handle_info({tcp, Socket, Data} = _Message,
         {error, _} ->
           {stop, normal, State}
       end;
-    {update_tags, _ID, _Tags, _UnsetTags} ->
-      % TODO: grailbag_reg:update_tags()
-      Reply = encode_error({server_error, ?EVENT_ID_UNIMPLEMENTED}),
+    {update_tags, ID, Tags, UnsetTags} ->
+      Reply = case grailbag_reg:update_tags(ID, Tags, UnsetTags) of
+        ok -> encode_success(ID);
+        {error, bad_id} -> encode_error(unknown_artifact);
+        {error, {schema, _, _} = Reason} -> encode_error(Reason);
+        {error, {storage, EventID}} -> encode_error({server_error, EventID})
+      end,
       case gen_tcp:send(Socket, Reply) of
         ok ->
           inet:setopts(Socket, [{active, once}]),
@@ -281,9 +285,13 @@ handle_info({tcp, Socket, Data} = _Message,
         {error, _} ->
           {stop, normal, State}
       end;
-    {update_tokens, _ID, _Tokens, _UnsetTokens} ->
-      % TODO: grailbag_reg:update_tokens()
-      Reply = encode_error({server_error, ?EVENT_ID_UNIMPLEMENTED}),
+    {update_tokens, ID, Tokens, UnsetTokens} ->
+      Reply = case grailbag_reg:update_tokens(ID, Tokens, UnsetTokens) of
+        ok -> encode_success(ID);
+        {error, bad_id} -> encode_error(unknown_artifact);
+        {error, {schema, _} = Reason} -> encode_error(Reason);
+        {error, {storage, EventID}} -> encode_error({server_error, EventID})
+      end,
       case gen_tcp:send(Socket, Reply) of
         ok ->
           inet:setopts(Socket, [{active, once}]),
@@ -466,7 +474,8 @@ encode_token(Token) ->
               | unknown_type
               | body_checksum_mismatch
               | artifact_has_tokens
-              | {schema, [term()]}.
+              | {schema, [grailbag:tag()], [grailbag:tag()]}
+              | {schema, [grailbag:token()]}.
 
 encode_error({server_error, EventID}) when bit_size(EventID) == 128 ->
   <<14:4, 0:28, EventID:128/bitstring>>;
@@ -478,7 +487,12 @@ encode_error(body_checksum_mismatch) ->
   <<15:4, 2:12, 0:16>>;
 encode_error(artifact_has_tokens) ->
   <<15:4, 3:12, 0:16>>;
-encode_error({schema, _TODO}) ->
+encode_error({schema, _TagDupNames, _TagMissingNames}) ->
+  % TODO: encode the errors
+  NErrors = 0,
+  Errors = <<>>,
+  <<15:4, 4:12, NErrors:16, Errors/binary>>;
+encode_error({schema, _UnknownTokenNames}) ->
   % TODO: encode the errors
   NErrors = 0,
   Errors = <<>>,

@@ -13,6 +13,7 @@
 
 %% public interface
 -export([store/7, delete/1]).
+-export([update_tags/3, update_tokens/3]).
 -export([list/1, info/1]).
 
 %% supervision tree API
@@ -25,6 +26,8 @@
 
 %%%---------------------------------------------------------------------------
 %%% types {{{
+
+-define(EVENT_ID_TODO, <<0:128>>).
 
 -define(ARTIFACT_TABLE, grailbag_artifacts).
 -define(TYPE_TABLE, grailbag_artifact_types).
@@ -71,12 +74,33 @@ store(ID, Type, BodySize, BodyHash, CTime, MTime, Tags) ->
 delete(ID) ->
   gen_server:call(?MODULE, {delete, ID}, infinity).
 
-%update_tags(ID, SetTags, UnsetTags) ->
-%  gen_server:call(?MODULE, {update_tags, ID, SetTags, UnsetTags}, infinity).
+%% @doc Update tags of an artifact.
 
-%update_tokens(ID, SetTokens, UnsetTokens) ->
-%  gen_server:call(?MODULE, {update_tokens, ID, SetTokens, UnsetTokens},
-%                  infinity).
+-spec update_tags(grailbag:artifact_id(),
+                  [{grailbag:tag(), grailbag:tag_value()}],
+                  [grailbag:tag()]) ->
+  ok | {error, Reason}
+  when Reason :: bad_id
+               | {schema, Dup :: [grailbag:tag()], Missing :: [grailbag:tag()]}
+               | {storage, EventID :: binary()}.
+
+update_tags(ID, SetTags, UnsetTags) ->
+  % `SetTags' is expected to be sorted by tag name
+  Request = {update_tags, ID, lists:keysort(1, SetTags), UnsetTags},
+  gen_server:call(?MODULE, Request, infinity).
+
+%% @doc Update tokens of an artifact.
+
+-spec update_tokens(grailbag:artifact_id(), [grailbag:token()],
+                    [grailbag:token()]) ->
+  ok | {error, Reason}
+  when Reason :: bad_id
+               | {schema, Unknown :: [grailbag:token()]}
+               | {storage, EventID :: binary()}.
+
+update_tokens(ID, SetTokens, UnsetTokens) ->
+  Request = {update_tokens, ID, SetTokens, UnsetTokens},
+  gen_server:call(?MODULE, Request, infinity).
 
 %% @doc List metadata of all artifacts of specific type.
 
@@ -197,6 +221,59 @@ handle_call({delete, ID} = _Request, _From, State) ->
   end,
   {reply, Result, State};
 
+handle_call({update_tags, ID, SetTags, UnsetTags} = _Request, _From,
+            State) ->
+  % NOTE: `SetTags' is sorted by the tag name (see `update_tags()' function)
+  case ets:lookup(?ARTIFACT_TABLE, ID) of
+    [#artifact{tags = OldTags} = Record] ->
+      % NOTE: `OldTags' is sorted by the tag name (see `make_record()'
+      % function)
+      FilterSet = sets:from_list(UnsetTags),
+      OldFilteredTags = lists:filter(
+        fun({T, _V}) -> not sets:is_element(T, FilterSet) end,
+        OldTags
+      ),
+      % `lists:keymerge()' gives precedence to the first list `SetTags' for
+      % keys in both lists, which is exactly what we need
+      NewTags = lists:keymerge(1, SetTags, OldFilteredTags),
+      % TODO: verify `NewTags' against schema
+      case grailbag_artifact:update_tags(ID, NewTags) of
+        ok ->
+          NewRecord = Record#artifact{tags = NewTags},
+          ets:insert(?ARTIFACT_TABLE, NewRecord),
+          {reply, ok, State};
+        {error, _Reason} ->
+          % TODO: log this error and return correlation ID
+          {reply, {error, {storage, ?EVENT_ID_TODO}}, State}
+      end;
+    [] ->
+      {reply, {error, bad_id}, State}
+  end;
+
+handle_call({update_tokens, ID, SetTokens, UnsetTokens} = _Request, _From,
+            State) ->
+  % TODO: move tags from another artifact, if applicable
+  case ets:lookup(?ARTIFACT_TABLE, ID) of
+    [#artifact{tokens = OldTokens} = Record] ->
+      FilterSet = sets:from_list(UnsetTokens),
+      NewTokens = lists:usort(
+        SetTokens ++
+        lists:filter(fun(T) -> not sets:is_element(T, FilterSet) end, OldTokens)
+      ),
+      % TODO: verify `NewTokens' against schema
+      case grailbag_artifact:update_tokens(ID, NewTokens) of
+        ok ->
+          NewRecord = Record#artifact{tokens = NewTokens},
+          ets:insert(?ARTIFACT_TABLE, NewRecord),
+          {reply, ok, State};
+        {error, _Reason} ->
+          % TODO: log this error and return correlation ID
+          {reply, {error, {storage, ?EVENT_ID_TODO}}, State}
+      end;
+    [] ->
+      {reply, {error, bad_id}, State}
+  end;
+
 %% unknown calls
 handle_call(_Request, _From, State) ->
   {reply, {error, unknown_call}, State}.
@@ -243,8 +320,8 @@ make_record({ID, Type, Size, Hash, CTime, MTime, Tags, Tokens} = _Info) ->
     body_hash = Hash,
     ctime = CTime,
     mtime = MTime,
-    tags = Tags,
-    tokens = Tokens
+    tags = lists:keysort(1, Tags),
+    tokens = lists:sort(Tokens)
   }.
 
 %%%---------------------------------------------------------------------------
