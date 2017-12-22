@@ -1,0 +1,705 @@
+#!/usr/bin/python
+
+import optparse
+import socket
+import platform
+import uuid
+import sys
+import time
+import hashlib
+import json
+
+#-----------------------------------------------------------------------------
+# command line options {{{
+
+parser = optparse.OptionParser(
+    usage = \
+        "\n  %prog store  <type> <filename> [tags ...]" \
+        "\n  %prog delete <id>" \
+        "\n  %prog tags   <id> -- [tags ...]" \
+        "\n  %prog tokens <id> -- [tokens ...]" \
+        "\n  %prog list" \
+        "\n  %prog list <type>" \
+        "\n  %prog info <id>" \
+        "\n  %prog get  <id> <filename>"
+)
+
+parser.add_option(
+    "--server", dest = "server",
+    default = "localhost:3255",
+    help = "server address", metavar = "ADDR",
+)
+
+(options, args) = parser.parse_args()
+if len(args) == 0:
+    parser.print_help()
+    sys.exit()
+
+operation = args[0]
+del args[0]
+
+# }}}
+#-----------------------------------------------------------------------------
+# GrailBagServer {{{
+
+#------------------------------------------------------
+# Constant {{{
+
+class Constant:
+    def __init__(self, name):
+        self.name = name
+    def __repr__(self):
+        return "<%s>" % (self.name,)
+
+# }}}
+#------------------------------------------------------
+# Artifact {{{
+
+class Artifact:
+    def __init__(self):
+        self.id = None
+        self.type = None
+        self.size = None
+        self.digest = None
+        self.ctime = None
+        self.mtime = None
+        self.tags = {}
+        self.tokens = []
+
+# }}}
+#------------------------------------------------------
+# ReqBuffer {{{
+
+class ReqBuffer:
+    def __init__(self, content = ""):
+        self.buf = bytearray(content)
+
+    def add(self, s):
+        self.buf.extend(s)
+
+    def add_int16(self, i):
+        self.buf.extend("\x00\x00")
+        self.buf[-2] = (i >> 8) & 0xff
+        self.buf[-1] = (i     ) & 0xff
+
+    def add_int32(self, i):
+        self.buf.extend("\x00\x00\x00\x00")
+        self.buf[-4] = (i >> 24) & 0xff
+        self.buf[-3] = (i >> 16) & 0xff
+        self.buf[-2] = (i >>  8) & 0xff
+        self.buf[-1] = (i      ) & 0xff
+
+    def add_str16(self, s):
+        self.buf.extend("\x00\x00" + s)
+        self.buf[-(len(s) + 2)] = (len(s) >> 8) & 0xff
+        self.buf[-(len(s) + 1)] = (len(s)     ) & 0xff
+
+    def add_str32(self, s):
+        self.buf.extend("\x00\x00\x00\x00" + s)
+        self.buf[-(len(s) + 4)] = (len(s) >> 24) & 0xff
+        self.buf[-(len(s) + 3)] = (len(s) >> 16) & 0xff
+        self.buf[-(len(s) + 2)] = (len(s) >>  8) & 0xff
+        self.buf[-(len(s) + 1)] = (len(s)      ) & 0xff
+
+    def add_pair(self, name, value):
+        self.buf.extend("\x00\x00\x00\x00\x00\x00")
+        self.buf[-6] = (len(name) >> 8) & 0xff
+        self.buf[-5] = (len(name)     ) & 0xff
+        self.buf[-4] = (len(value) >> 24) & 0xff
+        self.buf[-3] = (len(value) >> 16) & 0xff
+        self.buf[-2] = (len(value) >>  8) & 0xff
+        self.buf[-1] = (len(value)      ) & 0xff
+        self.buf.extend(name)
+        self.buf.extend(value)
+
+    def bytes(self):
+        return bytes(self.buf)
+
+    def __str__(self):
+        return str(self.buf)
+
+    def __len__(self):
+        return len(self.buf)
+
+# }}}
+#------------------------------------------------------
+# RespBuffer {{{
+
+TAG_OK = Constant("OK")
+TAG_OK_CHUNKSIZE = Constant("OK+CHUNKSIZE")
+TAG_INFO = Constant("INFO")
+TAG_LIST = Constant("LIST")
+TAG_TYPES = Constant("TYPES")
+TAG_ERROR = Constant("ERROR")
+TAG_SERVER_ERROR = Constant("SERVER_ERROR")
+
+ERR_CODE_NXID = Constant("UNKNOWN_ARTIFACT")
+ERR_CODE_NXTYPE = Constant("UNKNOWN_ARTIFACT_TYPE")
+ERR_CODE_CHECKSUM = Constant("BODY_CHECKSUM_MISMATCH")
+ERR_CODE_HAS_TOKENS = Constant("ARTIFACT_HAS_TOKENS")
+ERR_CODE_SCHEMA = Constant("SCHEMA_ERROR")
+
+class RespBuffer:
+    def __init__(self, size):
+        self.buf = bytearray(size)
+        self.write_pos = 0
+        self.pos = 0
+
+    def full(self):
+        return len(self.buf) <= self.write_pos
+
+    def left(self):
+        return len(self.buf) - self.write_pos
+
+    def add(self, content):
+        self.buf[self.write_pos : (self.write_pos + len(content))] = content
+        self.write_pos += len(content)
+
+    def start_reading(self):
+        self.pos = 4
+        tag = (self.buf[0] & 0xf0) >> 4
+        size = (self.buf[0] & 0x0f) << 24 | self.buf[1] << 16 | \
+               self.buf[2] << 8 | self.buf[3]
+
+        if tag == 0 and size == 0:
+            return (TAG_OK, None)
+
+        if tag == 0 and size > 0:
+            return (TAG_OK_CHUNKSIZE, size)
+
+        if tag == 1:
+            return (TAG_INFO, None)
+
+        if tag == 2:
+            return (TAG_LIST, size)
+
+        if tag == 3:
+            return (TAG_TYPES, size)
+
+        if tag == 14: # server error
+            return (TAG_SERVER_ERROR, None)
+
+        if tag == 15: # request error
+            code = size >> 16
+            if code == 0:
+                return (TAG_ERROR, ERR_CODE_NXID)
+            if code == 1:
+                return (TAG_ERROR, ERR_CODE_NXTYPE)
+            if code == 2:
+                return (TAG_ERROR, ERR_CODE_CHECKSUM)
+            if code == 3:
+                return (TAG_ERROR, ERR_CODE_HAS_TOKENS)
+            if code == 4:
+                # number of errors is encoded at byte boundary, so let's just
+                # go back a little
+                self.pos = 2
+                return (TAG_ERROR, ERR_CODE_SCHEMA)
+            # TODO: fail on unknown codes
+
+        # TODO: fail on unknown tags
+
+    def uuid(self):
+        result = uuid.UUID(bytes = str(self.buf[self.pos : (self.pos + 16)]))
+        self.pos += 16 # 128 bits
+        return result
+
+    def int16(self):
+        result = self.buf[self.pos    ] << 8 | \
+                 self.buf[self.pos + 1]
+        self.pos += 2
+        return result
+
+    def int32(self):
+        result = self.buf[self.pos    ] << 24 | \
+                 self.buf[self.pos + 1] << 16 | \
+                 self.buf[self.pos + 2] <<  8 | \
+                 self.buf[self.pos + 3]
+        self.pos += 4
+        return result
+
+    def int64(self):
+        result = self.buf[self.pos    ] << 56 | \
+                 self.buf[self.pos + 1] << 48 | \
+                 self.buf[self.pos + 2] << 40 | \
+                 self.buf[self.pos + 3] << 32 | \
+                 self.buf[self.pos + 4] << 24 | \
+                 self.buf[self.pos + 5] << 16 | \
+                 self.buf[self.pos + 6] <<  8 | \
+                 self.buf[self.pos + 7]
+        self.pos += 8
+        return result
+
+    def str16(self):
+        return self.str(self.int16())
+
+    def str32(self):
+        return self.str(self.int32())
+
+    def str(self, length):
+        result = self.buf[self.pos : (self.pos + length)]
+        self.pos += len(result)
+        return str(result)
+
+    def empty(self):
+        return self.pos >= len(self.buf)
+
+# }}}
+#------------------------------------------------------
+
+class GrailBagServer:
+
+    #------------------------------------------------------
+    # GrailBagServer.Download (context manager) {{{
+
+    class Download:
+        def __init__(self, info, conn, size, parent):
+            self.info = info
+            self._conn = conn
+            self._left = size
+            self._parent = parent
+
+        def __del__(self):
+            if self._left > 0 and self._parent is not None:
+                # abort the connection
+                self._parent._close()
+            self._parent = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if self._left > 0 and self._parent is not None:
+                # abort the connection
+                self._parent._close()
+            self._parent = None
+
+        def finished(self):
+            return self._left == 0
+
+        def read(self, size):
+            data = self._conn.recv(min(size, self._left))
+            self._left -= len(data)
+            return data
+
+        def chunks(self, size):
+            while self._left > 0:
+                data = self._conn.recv(min(size, self._left))
+                if data == "":
+                    raise IOError("unexpected EOF")
+                self._left -= len(data)
+                yield data
+
+    # }}}
+    #------------------------------------------------------
+
+    def __init__(self, host, port = 3255, timeout = 5):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.conn = None
+
+    #------------------------------------------------------
+    # _connect(), _close() {{{
+
+    def _connect(self):
+        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        conn.settimeout(self.timeout)
+        conn.connect((self.host, self.port))
+
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if platform.system() == "Linux":
+            # XXX: unportable, Linux-specific code
+            # send first probe after 30s
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+            # keep sending probes every 30s
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 30)
+            # after this many probes the connection drops
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 9)
+
+        self.conn = conn
+
+    def _close(self):
+        if self.conn is not None:
+            self.conn.close()
+        self.conn = None
+
+    # }}}
+    #------------------------------------------------------
+    # _send() {{{
+
+    def _send(self, buf):
+        if self.conn is None:
+            self._connect()
+
+        sizebuf = bytearray(4)
+        sizebuf[0] = (len(buf) >> 24) & 0xff
+        sizebuf[1] = (len(buf) >> 16) & 0xff
+        sizebuf[2] = (len(buf) >>  8) & 0xff
+        sizebuf[3] =  len(buf)        & 0xff
+        self.conn.send(sizebuf)
+        self.conn.send(str(buf))
+
+        sizebuf = RespBuffer(4)
+        while not sizebuf.full():
+            buf = self.conn.recv(sizebuf.left())
+            if buf == "":
+                raise Exception("unexpected EOF")
+            sizebuf.add(buf)
+
+        data = RespBuffer(sizebuf.int32())
+        while not data.full():
+            buf = self.conn.recv(data.left())
+            if buf == "":
+                raise Exception("unexpected EOF")
+            data.add(buf)
+
+        return data
+
+    # }}}
+    #------------------------------------------------------
+
+    def store(self, artifact_type, tags):
+        # artifact_type: string
+        # tags: {string => string}
+        # return: context manager with `chunk_size' and `artifact_id' fields,
+        # with `write(str)' and `done()' methods
+        request = ReqBuffer("S")
+        request.add_str16(artifact_type)
+        request.add_int32(len(tags))
+        for (name, value) in tags.iteritems():
+            request.add_pair(name, value)
+        pass # TODO
+
+    def delete(self, artifact_id):
+        request = ReqBuffer("D")
+        request.add(artifact_id.bytes)
+
+        reply = self._send(request)
+        (tag, info) = reply.start_reading()
+
+        if tag is TAG_OK:
+            artifact_id = reply.uuid()
+
+            if not reply.empty():
+                return ("leftovers", None, reply)
+                #raise Exception("unexpected leftovers")
+            return
+
+        # tag is not TAG_OK
+
+        return (tag, info, reply)
+
+    def update_tags(self, artifact_id, set_tags, unset_tags):
+        request = ReqBuffer("A")
+        request.add(artifact_id.bytes)
+        request.add_int32(len(set_tags))
+        request.add_int32(len(unset_tags))
+        for (name, value) in set_tags.iteritems():
+            request.add_pair(name, value)
+        for name in unset_tags:
+            request.add_str16(name)
+
+        reply = self._send(request)
+        (tag, info) = reply.start_reading()
+
+        if tag is TAG_OK:
+            artifact_id = reply.uuid()
+
+            if not reply.empty():
+                return ("leftovers", None, reply)
+                #raise Exception("unexpected leftovers")
+            return
+
+        # tag is not TAG_OK
+
+        return (tag, info, reply)
+
+    def update_tokens(self, artifact_id, set_tokens, unset_tokens):
+        request = ReqBuffer("O")
+        request.add(artifact_id.bytes)
+        request.add_int32(len(set_tokens))
+        request.add_int32(len(unset_tokens))
+        for name in set_tokens:
+            request.add_str16(name)
+        for name in unset_tokens:
+            request.add_str16(name)
+
+        reply = self._send(request)
+        (tag, info) = reply.start_reading()
+
+        if tag is TAG_OK:
+            artifact_id = reply.uuid()
+
+            if not reply.empty():
+                return ("leftovers", None, reply)
+                #raise Exception("unexpected leftovers")
+            return
+
+        # tag is not TAG_OK
+
+        return (tag, info, reply)
+
+    def types(self):
+        request = ReqBuffer("T")
+        reply = self._send(request)
+        (tag, info) = reply.start_reading()
+
+        if tag is TAG_TYPES:
+            ntypes = info
+            result = [reply.str16() for i in xrange(ntypes)]
+            if not reply.empty():
+                return ("leftovers", result, reply)
+                #raise Exception("unexpected leftovers")
+            return result
+
+        # tag is not TAG_TYPES
+
+        return (tag, info, reply)
+
+    #------------------------------------------------------
+    # GrailBagServer._decode_artifact_info() {{{
+
+    @staticmethod
+    def _decode_artifact_info(reply):
+        result = Artifact()
+        result.id = str(reply.uuid())
+        result.type = reply.str16()
+        result.size = reply.int64()
+        result.digest = reply.str16()
+        result.ctime = reply.int64()
+        result.mtime = reply.int64()
+        ntags = reply.int32()
+        ntokens = reply.int32()
+        for i in xrange(ntags):
+            tsize = reply.int16()
+            vsize = reply.int32()
+            tag = reply.str(tsize)
+            result.tags[tag] = reply.str(vsize)
+        for i in xrange(ntokens):
+            result.tokens.append(reply.str16())
+        return result
+
+    # }}}
+    #------------------------------------------------------
+
+    def artifacts(self, artifact_type):
+        request = ReqBuffer("L")
+        request.add_str16(artifact_type)
+
+        reply = self._send(request)
+        (tag, info) = reply.start_reading()
+
+        if tag is TAG_LIST:
+            nartifacts = info
+            result = [
+                GrailBagServer._decode_artifact_info(reply)
+                for i in xrange(nartifacts)
+            ]
+            if not reply.empty():
+                return ("leftovers", result, reply)
+                #raise Exception("unexpected leftovers")
+            return result
+
+        # tag is not TAG_LIST
+
+        return (tag, info, reply)
+
+    def info(self, artifact_id):
+        request = ReqBuffer("I")
+        request.add(artifact_id.bytes)
+
+        reply = self._send(request)
+        (tag, info) = reply.start_reading()
+
+        if tag is TAG_INFO:
+            result = GrailBagServer._decode_artifact_info(reply)
+            if not reply.empty():
+                return ("leftovers", result, reply)
+                #raise Exception("unexpected leftovers")
+            return result
+
+        # tag is not TAG_INFO
+
+        return (tag, info, reply)
+
+    def get(self, artifact_id):
+        # returns a context manager
+        request = ReqBuffer("G")
+        request.add(artifact_id.bytes)
+
+        reply = self._send(request)
+        (tag, info) = reply.start_reading()
+
+        if tag is TAG_INFO:
+            info = GrailBagServer._decode_artifact_info(reply)
+            if not reply.empty():
+                self._close()
+                return ("leftovers", result, reply)
+                #raise Exception("unexpected leftovers")
+            return GrailBagServer.Download(info, self.conn, info.size, self)
+
+        # tag is not TAG_INFO
+
+        return (tag, info, reply)
+
+# }}}
+#-----------------------------------------------------------------------------
+# operations {{{
+
+#------------------------------------------------------
+# format_artifact_info() {{{
+
+def format_artifact_info(info):
+    return (
+        "ID {id} type={type}\n"
+        "  body: size={size} SHA1={hash}\n"
+        "  ctime: [{ctime}] mtime: [{mtime}]\n"
+        "  tags: {tags}\n"
+        "  tokens: {tokens}"
+    ).format(
+        id = info.id, type = info.type,
+        size = info.size, hash = info.digest.encode("hex"),
+        ctime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(info.ctime)),
+        mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(info.mtime)),
+        tags = " ".join("<%s=%s>" % (n,info.tags[n]) for n in sorted(info.tags)),
+        tokens = " ".join("(%s)" % (n,) for n in info.tokens),
+    )
+
+# }}}
+#------------------------------------------------------
+
+#------------------------------------------------------
+# STORE type filename [tags ...] {{{
+
+def op_store(server, artifact_type, filename, *tags):
+    set_tags = dict(t.split("=") for t in tags if "=" in t)
+    with open(filename, "r") as source:
+        with server.store(artifact_type, set_tags) as upload:
+            # upload.chunk_size is guaranteed to be at least 4096 bytes
+            # upload.artifact_id
+            chunk = source.read(4096)
+            while chunk != "":
+                upload.write(chunk)
+                chunk = source.read(4096)
+            upload.done()
+            print "uploaded"
+
+# }}}
+#------------------------------------------------------
+# DELETE id {{{
+
+def op_delete(server, artifact_id):
+    server.delete(uuid.UUID(artifact_id))
+    print "deleted"
+
+# }}}
+#------------------------------------------------------
+# TAGS id tags ... {{{
+
+def op_tags(server, artifact_id, *tags):
+    set_tags = dict(t.split("=") for t in tags if "=" in t)
+    unset_tags = [t[1:] for t in tags if t.startswith("-")]
+    server.update_tags(uuid.UUID(artifact_id), set_tags, unset_tags)
+    print "tags updated"
+
+# }}}
+#------------------------------------------------------
+# TOKENS id tokens ... {{{
+
+def op_tokens(server, artifact_id, *tokens):
+    set_tokens = [t[1:] for t in tokens if t.startswith("+")]
+    unset_tokens = [t[1:] for t in tokens if t.startswith("-")]
+    server.update_tokens(uuid.UUID(artifact_id), set_tokens, unset_tokens)
+    print "tokens updated"
+
+# }}}
+#------------------------------------------------------
+# LIST [type] {{{
+
+def op_list(server, artifact_type = None):
+    if artifact_type is None:
+        types = server.types()
+        if len(types) == 0:
+            print "no known artifact types"
+        else:
+            print "artifact types:"
+            for t in types:
+                print "  " + t
+        return
+
+    artifacts = server.artifacts(artifact_type)
+    print "known artifacts:"
+    print "---"
+    for a in artifacts:
+        print format_artifact_info(a)
+        print "---"
+
+# }}}
+#------------------------------------------------------
+# INFO id {{{
+
+def op_info(server, artifact_id):
+    info = server.info(uuid.UUID(artifact_id))
+    print format_artifact_info(info)
+
+# }}}
+#------------------------------------------------------
+# GET id filename {{{
+
+def op_get(server, artifact_id, filename):
+    with server.get(uuid.UUID(artifact_id)) as download:
+        ctx = hashlib.sha1() # TODO: change to SHA512
+        with open(filename, "w") as output:
+            for chunk in download.chunks(4096):
+                ctx.update(chunk)
+                output.write(chunk)
+        digest = ctx.digest()
+        if digest != download.info.digest:
+            # TODO: react somehow (call `os.unlink(filename)'?)
+            print "digest mismatch!"
+            return 1
+        print format_artifact_info(download.info)
+
+# }}}
+#------------------------------------------------------
+# WATCH type {{{ (TODO)
+
+def op_watch(server, artifact_type):
+    pass # TODO
+
+# }}}
+#------------------------------------------------------
+
+OPERATIONS = {
+    "store":  {"op": op_store,  "nargs": lambda n: n >= 2},
+    "delete": {"op": op_delete, "nargs": lambda n: n == 1},
+    "tags":   {"op": op_tags,   "nargs": lambda n: n >= 2},
+    "tokens": {"op": op_tokens, "nargs": lambda n: n >= 2},
+    "list":   {"op": op_list,   "nargs": lambda n: n <= 1},
+    "info":   {"op": op_info,   "nargs": lambda n: n == 1},
+    "get":    {"op": op_get,    "nargs": lambda n: n == 2},
+    "watch":  {"op": op_watch,  "nargs": lambda n: n == 1},
+}
+
+# }}}
+#-----------------------------------------------------------------------------
+
+if operation not in OPERATIONS:
+    parser.error('unknown operation "%s"' % (operation,))
+
+if not OPERATIONS[operation]["nargs"](len(args)):
+    parser.error('wrong number of arguments for "%s"' % (operation,))
+
+if ":" in options.server:
+    (host, port) = options.server.split(":")
+    server = GrailBagServer(host = host, port = int(port))
+else:
+    server = GrailBagServer(host = options.server)
+
+# TODO: try..except
+ret = OPERATIONS[operation]["op"](server, *args)
+if isinstance(ret, (int, long)):
+    sys.exit(ret)
+
+#-----------------------------------------------------------------------------
+# vim:ft=python:foldmethod=marker
