@@ -261,8 +261,8 @@ handle_info({tcp, Socket, Data} = _Message,
       Reply = case grailbag_reg:delete(ID) of
         ok -> encode_success(ID);
         {error, bad_id} -> encode_error(unknown_artifact);
-        % TODO: log this error
-        {error, _Reason} -> encode_error({server_error, ?EVENT_ID_TODO})
+        {error, artifact_has_tokens} -> encode_error(artifact_has_tokens);
+        {error, {storage, EventID}} -> encode_error({server_error, EventID})
       end,
       case gen_tcp:send(Socket, Reply) of
         ok ->

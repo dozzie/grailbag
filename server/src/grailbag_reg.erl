@@ -69,7 +69,10 @@ store(ID, Type, BodySize, BodyHash, CTime, MTime, Tags) ->
 %% @doc Delete an artifact from memory and from disk.
 
 -spec delete(grailbag:artifact_id()) ->
-  ok | {error, bad_id | file:posix()}.
+  ok | {error, Reason}
+  when Reason :: bad_id
+               | artifact_has_tokens
+               | {storage, EventID :: binary()}.
 
 delete(ID) ->
   gen_server:call(?MODULE, {delete, ID}, infinity).
@@ -211,15 +214,21 @@ handle_call({store, {ID, Type, _Size, _Hash, _CTime, _MTime, _Tags, []} = Info} 
 
 handle_call({delete, ID} = _Request, _From, State) ->
   case ets:lookup(?ARTIFACT_TABLE, ID) of
-    [#artifact{type = Type}] ->
-      % TODO: check if the artifact has any tokens set
+    [#artifact{type = Type, tokens = []}] ->
       ets:delete_object(?TYPE_TABLE, {Type, ID}),
       ets:delete(?ARTIFACT_TABLE, ID),
-      Result = grailbag_artifact:delete(ID);
+      case grailbag_artifact:delete(ID) of
+        ok ->
+          {reply, ok, State};
+        {error, _Reason} ->
+          % TODO: log this error and return correlation ID
+          {reply, {error, {storage, ?EVENT_ID_TODO}}, State}
+      end;
+    [#artifact{tokens = [_|_]}] ->
+      {reply, {error, artifact_has_tokens}, State};
     [] ->
-      Result = {error, bad_id}
-  end,
-  {reply, Result, State};
+      {reply, {error, bad_id}, State}
+  end;
 
 handle_call({update_tags, ID, SetTags, UnsetTags} = _Request, _From,
             State) ->
