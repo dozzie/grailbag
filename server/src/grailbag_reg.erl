@@ -243,8 +243,11 @@ handle_call({update_tags, ID, SetTags, UnsetTags} = _Request, _From,
       NewTags = lists:keymerge(1, SetTags, OldFilteredTags),
       % TODO: verify `NewTags' against schema
       case grailbag_artifact:update_tags(ID, NewTags) of
-        ok ->
-          NewRecord = Record#artifact{tags = NewTags},
+        {ok, MTime} ->
+          NewRecord = Record#artifact{
+            mtime = MTime,
+            tags = NewTags
+          },
           ets:insert(?ARTIFACT_TABLE, NewRecord),
           {reply, ok, State};
         {error, _Reason} ->
@@ -267,8 +270,11 @@ handle_call({update_tokens, ID, SetTokens, UnsetTokens} = _Request, _From,
       ),
       % TODO: verify `NewTokens' against schema
       case grailbag_artifact:update_tokens(ID, NewTokens) of
-        ok ->
-          NewRecord = Record#artifact{tokens = NewTokens},
+        {ok, MTime} ->
+          NewRecord = Record#artifact{
+            mtime = MTime,
+            tokens = NewTokens
+          },
           ets:insert(?ARTIFACT_TABLE, NewRecord),
           {reply, ok, State};
         {error, _Reason} ->

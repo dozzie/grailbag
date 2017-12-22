@@ -169,7 +169,7 @@ finish(Handle) ->
 
 -spec update_tags(grailbag:artifact_id(),
                   [{grailbag:tag(), grailbag:tag_value()}]) ->
-  ok | {error, Reason}
+  {ok, grailbag:mtime()} | {error, Reason}
   when Reason :: {schema, Dup :: [grailbag:tag()], Missing :: [grailbag:tag()]}
                | checksum
                | term().
@@ -185,7 +185,10 @@ update_tags(ID, Tags) ->
       case encode_info_file(NewFile, ID, Type, Size, Hash, CTime, MTime,
                             Tags, Tokens) of
         ok ->
-          file:rename(NewFile, OldFile);
+          case file:rename(NewFile, OldFile) of
+            ok -> {ok, MTime};
+            {error, Reason} -> {error, Reason}
+          end;
         {error, Reason} ->
           file:delete(NewFile),
           {error, Reason}
@@ -205,7 +208,7 @@ update_tags(ID, Tags) ->
 %% @see update_tags/2
 
 -spec update_tokens(grailbag:artifact_id(), [grailbag:token()]) ->
-  ok | {error, Reason}
+  {ok, grailbag:mtime()} | {error, Reason}
   when Reason :: {schema, Unknown :: [grailbag:token()]}
                | checksum
                | term().
@@ -221,7 +224,10 @@ update_tokens(ID, Tokens) ->
       case encode_info_file(NewFile, ID, Type, Size, Hash, CTime, MTime,
                             Tags, Tokens) of
         ok ->
-          file:rename(NewFile, OldFile);
+          case file:rename(NewFile, OldFile) of
+            ok -> {ok, MTime};
+            {error, Reason} -> {error, Reason}
+          end;
         {error, Reason} ->
           file:delete(NewFile),
           {error, Reason}
