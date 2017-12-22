@@ -167,25 +167,21 @@ init(_Args) ->
   ets:new(?ARTIFACT_TABLE,
           [set, named_table, protected, {keypos, #artifact.id}]),
   ets:new(?TYPE_TABLE, [bag, named_table, protected]),
-  lists:foldl(
-    fun(ID, Acc) ->
-      case grailbag_artifact:info(ID) of
-        {ok, {ID, Type, _Size, _Hash, _CTime, _MTime, _Tags, _Tokens} = Info} ->
-          ets:insert(?ARTIFACT_TABLE, make_record(Info)),
-          ets:insert(?TYPE_TABLE, {Type, ID}),
-          Acc;
-        undefined ->
-          Acc
-      end
-    end,
-    ignore,
-    grailbag_artifact:list()
-  ),
+  lists:foreach(fun ets_add_artifact/1, grailbag_artifact:list()),
   grailbag_log:info("starting artifact registry", [
     {artifacts, ets:info(?ARTIFACT_TABLE, size)}
   ]),
   State = #state{},
   {ok, State}.
+
+ets_add_artifact(ID) ->
+  case grailbag_artifact:info(ID) of
+    {ok, {ID, Type, _Size, _Hash, _CTime, _MTime, _Tags, _Tokens} = Info} ->
+      ets:insert(?ARTIFACT_TABLE, make_record(Info)),
+      ets:insert(?TYPE_TABLE, {Type, ID});
+    undefined ->
+      ok
+  end.
 
 %% @private
 %% @doc Clean up {@link gen_server} state.
