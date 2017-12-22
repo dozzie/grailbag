@@ -14,7 +14,7 @@
 %% public interface
 -export([store/7, delete/1]).
 -export([update_tags/3, update_tokens/3]).
--export([list/1, info/1]).
+-export([list/0, list/1, info/1]).
 
 %% supervision tree API
 -export([start/0, start_link/0]).
@@ -106,6 +106,16 @@ update_tags(ID, SetTags, UnsetTags) ->
 update_tokens(ID, SetTokens, UnsetTokens) ->
   Request = {update_tokens, ID, SetTokens, UnsetTokens},
   gen_server:call(?MODULE, Request, infinity).
+
+%% @doc List known artifact types.
+%%
+%% @todo Consult loaded schema instead of known artifacts
+
+-spec list() ->
+  [grailbag:artifact_type()].
+
+list() ->
+  lists:usort([Type || {Type, _ID} <- ets:tab2list(?TYPE_TABLE)]).
 
 %% @doc List metadata of all artifacts of specific type.
 

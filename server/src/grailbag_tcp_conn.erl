@@ -302,6 +302,16 @@ handle_info({tcp, Socket, Data} = _Message,
         {error, _} ->
           {stop, normal, State}
       end;
+    list_types ->
+      Types = grailbag_reg:list(),
+      Reply = encode_types_list(Types),
+      case gen_tcp:send(Socket, Reply) of
+        ok ->
+          inet:setopts(Socket, [{active, once}]),
+          {noreply, State};
+        {error, _} ->
+          {stop, normal, State}
+      end;
     {list, Type} ->
       % TODO: check if the type is known
       Artifacts = grailbag_reg:list(Type),
@@ -432,6 +442,17 @@ encode_list(Artifacts) ->
     [encode_artifact_info(Info) || Info <- Artifacts]
   ].
 
+%% @doc Encode message with list of artifact types.
+
+-spec encode_types_list([grailbag:artifact_type()]) ->
+  iolist().
+
+encode_types_list(Types) ->
+  _Result = [
+    <<3:4, (length(Types)):28>>,
+    [[<<(size(T)):16>>, T] || T <- Types]
+  ].
+
 %% @doc Encode information about a single artifact.
 %%
 %% @see encode_info/1
@@ -521,6 +542,7 @@ encode_error({schema, _UnknownTokenNames}) ->
   | {delete, ID}
   | {update_tags, ID, Tags, UnsetTags}
   | {update_tokens, ID, Tokens, UnsetTokens}
+  | list_types
   | {list, Type}
   %| {watch, Type, ...} % TODO
   | {info, ID}
@@ -565,6 +587,8 @@ decode_request(<<"O", UUID:128/bitstring,
     error ->
       {error, badarg}
   end;
+decode_request(<<"T">>) ->
+  list_types;
 decode_request(<<"L", TypeLen:16, Type:TypeLen/binary>>) ->
   {list, Type};
 %decode_request(<<"W", TypeLen:16, Type:TypeLen/binary, QueryData/binary>>) ->
