@@ -8,9 +8,6 @@
 %%%   <i>info</i> file structure: artifact type, tags, tokens.
 %%%
 %%% @todo Save artifact's schema.
-%%% @todo Coordinate {@link delete/1}, {@link info/1},
-%%%   {@link update_tags/2}, and {@link update_tokens/2} (prevent race
-%%%   conditions).
 %%% @todo Make {@link update_tags/2} and {@link update_tokens/2} more
 %%%   efficient.
 %%% @end
@@ -286,8 +283,6 @@ read(_Handle = #artifact{fh = FH}, Size) ->
   file:read(FH, Size).
 
 %% @doc Read artifact's metadata.
-%%
-%% @todo Upload time.
 %%
 %% @see open/1
 
