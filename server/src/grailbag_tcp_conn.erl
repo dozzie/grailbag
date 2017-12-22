@@ -186,6 +186,9 @@ handle_info({tcp, Socket, Data} = _Message,
             State = #state{socket = Socket, upload_hash = LocalHash,
                            handle = {upload, ID, Handle}}) ->
   if
+    size(Data) > ?READ_CHUNK_SIZE ->
+      grailbag_log:info("client sent bigger upload chunk than allowed"),
+      {stop, normal, State};
     LocalHash == undefined, size(Data) > 0 ->
       % another body chunk
       case grailbag_artifact:write(Handle, Data) of
@@ -242,8 +245,8 @@ handle_info({tcp, Socket, Data} = _Message,
         {ok, Handle, ID} ->
           % NOTE: socket is and stays in passive state and 4-byte size prefix
           % packet mode
-          % TODO: send allowed chunk size to the client
-          Reply = encode_success(ID),
+          % XXX: maximum allowed chunk size must be at least 4kB
+          Reply = encode_success(ID, ?READ_CHUNK_SIZE),
           NewState = State#state{handle = {upload, ID, Handle}};
         {error, _Reason} ->
           % TODO: log this error
@@ -400,6 +403,15 @@ code_change(_OldVsn, State, _Extra) ->
 encode_success(ID) ->
   UUID = grailbag_uuid:parse(binary_to_list(ID)),
   <<0:4, 0:28, UUID/binary>>.
+
+%% @doc Encode "operation succeeded" message.
+
+-spec encode_success(grailbag:artifact_id(), pos_integer()) ->
+  binary().
+
+encode_success(ID, MaxChunkSize) when MaxChunkSize > 0 ->
+  UUID = grailbag_uuid:parse(binary_to_list(ID)),
+  <<0:4, MaxChunkSize:28, UUID/binary>>.
 
 %% @doc Encode message with artifact metadata.
 
