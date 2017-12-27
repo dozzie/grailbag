@@ -2,6 +2,8 @@
 
 import optparse
 import socket
+import errno
+import os
 import platform
 import uuid
 import sys
@@ -43,13 +45,106 @@ del args[0]
 # GrailBagServer {{{
 
 #------------------------------------------------------
+# exceptions {{{
+
+class GrailBagException(Exception):
+    pass
+
+class NetworkError(GrailBagException):
+    def __init__(self, exception):
+        super(NetworkError, self).__init__(*exception.args)
+        self.errno = exception.errno
+        self.strerror = exception.strerror
+        self.filename = exception.filename
+
+    def __str__(self):
+        if self.filename is not None:
+            return "[Errno %s] %s: '%s'" % \
+                   (self.errno, self.strerror, self.filename)
+        else:
+            return "[Errno %s] %s" % (self.errno, self.strerror)
+
+class ProtocolError(NetworkError):
+    def __init__(self, message, *args):
+        self.args = (message,) + args
+        self.message = message % args
+        self.errno = errno.EBADMSG
+        self.strerror = os.strerror(self.errno)
+        self.filename = None
+
+    def __str__(self):
+        return self.message
+
+class OperationError(GrailBagException):
+    pass
+
+class ServerError(OperationError):
+    def __init__(self, event_id):
+        self.event_id = str(event_id)
+        self.args = (str(event_id),)
+        self.message = ""
+
+    def __str__(self):
+        return "server error (event ID: %s), check logs for details" % \
+               (self.event_id,)
+
+class UnknownArtifact(OperationError):
+    def __init__(self, artifact_id):
+        self.artifact = str(artifact_id)
+        self.args = (str(artifact_id),)
+        self.message = ""
+
+    def __str__(self):
+        return "artifact %s does not exist" % (self.artifact,)
+
+class UnknownType(OperationError):
+    def __init__(self, artifact_type):
+        self.type = artifact_type
+        self.args = (artifact_type,)
+        self.message = ""
+
+    def __str__(self):
+        return "artifact type %s does not exist" % (self.type,)
+
+class UploadChecksumMismatch(OperationError):
+    def __init__(self, artifact_id):
+        self.artifact = str(artifact_id)
+        self.args = (str(artifact_id),)
+        self.message = ""
+
+    def __str__(self):
+        return "uploading artifact %s failed: bad checksum" % (self.artifact,)
+
+class ArtifactHasTokens(OperationError):
+    def __init__(self, artifact_id):
+        self.artifact = str(artifact_id)
+        self.args = (str(artifact_id),)
+        self.message = ""
+
+    def __str__(self):
+        return "deleting artifact %s failed: artifact still has tokens" % \
+               (self.artifact,)
+
+class SchemaError(OperationError):
+    # TODO: structure (__init__())
+
+    def __str__(self):
+        # TODO: better message
+        return "some schema validation error"
+
+# }}}
+#------------------------------------------------------
 # Constant {{{
 
 class Constant:
     def __init__(self, name):
         self.name = name
-    def __repr__(self):
+
+    def __str__(self):
         return "<%s>" % (self.name,)
+
+    def __repr__(self):
+        return str(self)
 
 # }}}
 #------------------------------------------------------
@@ -177,7 +272,8 @@ class RespBuffer:
             return (TAG_TYPES, size)
 
         if tag == 14: # server error
-            return (TAG_SERVER_ERROR, None)
+            event_id = self.uuid()
+            raise ServerError(event_id)
 
         if tag == 15: # request error
             code = size >> 16
@@ -194,9 +290,9 @@ class RespBuffer:
                 # go back a little
                 self.pos = 2
                 return (TAG_ERROR, ERR_CODE_SCHEMA)
-            # TODO: fail on unknown codes
+            raise ProtocolError("unrecognized request error code: %d", code)
 
-        # TODO: fail on unknown tags
+        raise ProtocolError("unrecognized reply tag: %s", tag)
 
     def uuid(self):
         result = uuid.UUID(bytes = str(self.buf[self.pos : (self.pos + 16)]))
@@ -285,7 +381,8 @@ class GrailBagServer:
             while self._left > 0:
                 data = self._conn.recv(min(size, self._left))
                 if data == "":
-                    raise IOError("unexpected EOF")
+                    self._parent._close()
+                    raise ProtocolError("connection closed unexpectedly")
                 self._left -= len(data)
                 yield data
 
@@ -304,7 +401,11 @@ class GrailBagServer:
     def _connect(self):
         conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         conn.settimeout(self.timeout)
-        conn.connect((self.host, self.port))
+        try:
+            conn.connect((self.host, self.port))
+        except Exception as e:
+            conn.close()
+            raise NetworkError(e)
 
         conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         if platform.system() == "Linux":
@@ -325,7 +426,7 @@ class GrailBagServer:
 
     # }}}
     #------------------------------------------------------
-    # _send() {{{
+    # _send(), _recv() {{{
 
     def _send(self, buf):
         if self.conn is None:
@@ -336,21 +437,29 @@ class GrailBagServer:
         sizebuf[1] = (len(buf) >> 16) & 0xff
         sizebuf[2] = (len(buf) >>  8) & 0xff
         sizebuf[3] =  len(buf)        & 0xff
-        self.conn.send(sizebuf)
-        self.conn.send(str(buf))
+        try:
+            self.conn.send(sizebuf)
+            self.conn.send(str(buf))
+        except Exception as e:
+            self._close()
+            raise NetworkError(e)
+        return self._recv()
 
+    def _recv(self):
         sizebuf = RespBuffer(4)
         while not sizebuf.full():
             buf = self.conn.recv(sizebuf.left())
             if buf == "":
-                raise Exception("unexpected EOF")
+                self._close()
+                raise ProtocolError("connection closed unexpectedly")
             sizebuf.add(buf)
 
         data = RespBuffer(sizebuf.int32())
         while not data.full():
             buf = self.conn.recv(data.left())
             if buf == "":
-                raise Exception("unexpected EOF")
+                self._close()
+                raise ProtocolError("connection closed unexpectedly")
             data.add(buf)
 
         return data
@@ -381,13 +490,16 @@ class GrailBagServer:
             artifact_id = reply.uuid()
 
             if not reply.empty():
-                return ("leftovers", None, reply)
-                #raise Exception("unexpected leftovers")
-            return
+                raise ProtocolError("unexpected message payload")
+            return True
 
-        # tag is not TAG_OK
+        if tag is TAG_ERROR and info is ERR_CODE_NXID:
+            return False
 
-        return (tag, info, reply)
+        if tag is TAG_ERROR and info is ERR_CODE_HAS_TOKENS:
+            raise ArtifactHasTokens(artifact_id)
+
+        raise ProtocolError("unexpected reply (tag %s)", tag)
 
     def update_tags(self, artifact_id, set_tags, unset_tags):
         request = ReqBuffer("A")
@@ -406,13 +518,16 @@ class GrailBagServer:
             artifact_id = reply.uuid()
 
             if not reply.empty():
-                return ("leftovers", None, reply)
-                #raise Exception("unexpected leftovers")
+                raise ProtocolError("unexpected message payload")
             return
 
-        # tag is not TAG_OK
+        if tag is TAG_ERROR and info is ERR_CODE_NXID:
+            raise UnknownArtifact(artifact_id)
 
-        return (tag, info, reply)
+        if tag is TAG_ERROR and info is ERR_CODE_SCHEMA:
+            raise SchemaError() # TODO: more error information
+
+        raise ProtocolError("unexpected reply (tag %s)", tag)
 
     def update_tokens(self, artifact_id, set_tokens, unset_tokens):
         request = ReqBuffer("O")
@@ -431,13 +546,16 @@ class GrailBagServer:
             artifact_id = reply.uuid()
 
             if not reply.empty():
-                return ("leftovers", None, reply)
-                #raise Exception("unexpected leftovers")
+                raise ProtocolError("unexpected message payload")
             return
 
-        # tag is not TAG_OK
+        if tag is TAG_ERROR and info is ERR_CODE_NXID:
+            raise UnknownArtifact(artifact_id)
 
-        return (tag, info, reply)
+        if tag is TAG_ERROR and info is ERR_CODE_SCHEMA:
+            raise SchemaError() # TODO: more error information
+
+        raise ProtocolError("unexpected reply (tag %s)", tag)
 
     def types(self):
         request = ReqBuffer("T")
@@ -448,13 +566,10 @@ class GrailBagServer:
             ntypes = info
             result = [reply.str16() for i in xrange(ntypes)]
             if not reply.empty():
-                return ("leftovers", result, reply)
-                #raise Exception("unexpected leftovers")
+                raise ProtocolError("unexpected message payload")
             return result
 
-        # tag is not TAG_TYPES
-
-        return (tag, info, reply)
+        raise ProtocolError("unexpected reply (tag %s)", tag)
 
     #------------------------------------------------------
     # GrailBagServer._decode_artifact_info() {{{
@@ -496,13 +611,13 @@ class GrailBagServer:
                 for i in xrange(nartifacts)
             ]
             if not reply.empty():
-                return ("leftovers", result, reply)
-                #raise Exception("unexpected leftovers")
+                raise ProtocolError("unexpected message payload")
             return result
 
-        # tag is not TAG_LIST
+        if tag is TAG_ERROR and info is ERR_CODE_NXTYPE:
+            raise UnknownType(artifact_type)
 
-        return (tag, info, reply)
+        raise ProtocolError("unexpected reply (tag %s)", tag)
 
     def info(self, artifact_id):
         request = ReqBuffer("I")
@@ -514,13 +629,13 @@ class GrailBagServer:
         if tag is TAG_INFO:
             result = GrailBagServer._decode_artifact_info(reply)
             if not reply.empty():
-                return ("leftovers", result, reply)
-                #raise Exception("unexpected leftovers")
+                raise ProtocolError("unexpected message payload")
             return result
 
-        # tag is not TAG_INFO
+        if tag is TAG_ERROR and info is ERR_CODE_NXID:
+            raise UnknownArtifact(artifact_id)
 
-        return (tag, info, reply)
+        raise ProtocolError("unexpected reply (tag %s)", tag)
 
     def get(self, artifact_id):
         # returns a context manager
@@ -534,13 +649,13 @@ class GrailBagServer:
             info = GrailBagServer._decode_artifact_info(reply)
             if not reply.empty():
                 self._close()
-                return ("leftovers", result, reply)
-                #raise Exception("unexpected leftovers")
+                raise ProtocolError("unexpected message payload")
             return GrailBagServer.Download(info, self.conn, info.size, self)
 
-        # tag is not TAG_INFO
+        if tag is TAG_ERROR and info is ERR_CODE_NXID:
+            raise UnknownArtifact(artifact_id)
 
-        return (tag, info, reply)
+        raise ProtocolError("unexpected reply (tag %s)", tag)
 
 # }}}
 #-----------------------------------------------------------------------------
@@ -696,8 +811,12 @@ if ":" in options.server:
 else:
     server = GrailBagServer(host = options.server)
 
-# TODO: try..except
-ret = OPERATIONS[operation]["op"](server, *args)
+try:
+    ret = OPERATIONS[operation]["op"](server, *args)
+except GrailBagException as e:
+    print >>sys.stderr, str(e)
+    sys.exit(255)
+
 if isinstance(ret, (int, long)):
     sys.exit(ret)
 
