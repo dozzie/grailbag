@@ -91,8 +91,38 @@ delete(ID) ->
 
 update_tags(ID, SetTags, UnsetTags) ->
   % `SetTags' is expected to be sorted by tag name
-  Request = {update_tags, ID, lists:keysort(1, SetTags), UnsetTags},
+  Request = {update_tags, ID, sort_tags(SetTags), UnsetTags},
   gen_server:call(?MODULE, Request, infinity).
+
+%%----------------------------------------------------------
+%% sort_tags() {{{
+
+%% @doc Sort list of tags, removing tag duplicates.
+
+-spec sort_tags([{grailbag:tag(), grailbag:tag_value()}]) ->
+  [{grailbag:tag(), grailbag:tag_value()}].
+
+sort_tags([] = _Tags) ->
+  [];
+sort_tags(Tags) ->
+  [{Tag, _} = Elem | Rest] = lists:keysort(1, Tags),
+  [Elem | filter_dup_tags(Tag, Rest)].
+
+%% @doc Remove duplicate tags from ordered list.
+
+-spec filter_dup_tags(grailbag:tag(),
+                      [{grailbag:tag(), grailbag:tag_value()}]) ->
+  [{grailbag:tag(), grailbag:tag_value()}].
+
+filter_dup_tags(OldTag, [{OldTag,_} | Rest] = _Tags) ->
+  filter_dup_tags(OldTag, Rest);
+filter_dup_tags(OldTag, [{Tag,_} = Elem | Rest] = _Tags) when OldTag < Tag ->
+  [Elem | filter_dup_tags(Tag, Rest)];
+filter_dup_tags(_OldTag, []) ->
+  [].
+
+%% }}}
+%%----------------------------------------------------------
 
 %% @doc Update tokens of an artifact.
 
@@ -291,14 +321,7 @@ handle_call({update_tags, ID, SetTags, UnsetTags} = _Request, _From,
     [#artifact{tags = OldTags} = Record] ->
       % NOTE: `OldTags' is sorted by the tag name (see `make_record()'
       % function)
-      FilterSet = sets:from_list(UnsetTags),
-      OldFilteredTags = lists:filter(
-        fun({T, _V}) -> not sets:is_element(T, FilterSet) end,
-        OldTags
-      ),
-      % `lists:keymerge()' gives precedence to the first list `SetTags' for
-      % keys in both lists, which is exactly what we need
-      NewTags = lists:keymerge(1, SetTags, OldFilteredTags),
+      NewTags = merge_tags(OldTags, SetTags, sets:from_list(UnsetTags)),
       % TODO: verify `NewTags' against schema
       case grailbag_artifact:update_tags(ID, NewTags) of
         {ok, MTime} ->
@@ -432,6 +455,42 @@ move_tokens(NewID, Type, Tokens) ->
   ),
   % TODO: report write errors
   ok.
+
+%%%---------------------------------------------------------------------------
+
+%% @doc Merge old tags list with list of tags to set, removing tags from
+%%   `UnsetTags' set.
+%%
+%%   Function assumes that both `OldTags' and `SetTags' are sorted by tag
+%%   name.
+
+-spec merge_tags([{grailbag:tag(), grailbag:tag_value()}],
+                 [{grailbag:tag(), grailbag:tag_value()}],
+                 set()) ->
+  [{grailbag:tag(), grailbag:tag_value()}].
+
+merge_tags([] = _OldTags, SetTags, _UnsetTags) ->
+  SetTags;
+merge_tags(OldTags, [] = _SetTags, UnsetTags) ->
+  lists:filter(fun({T,_}) -> not sets:is_element(T, UnsetTags) end, OldTags);
+
+merge_tags([{OTag, _OValue} = Old | ORest] = _OldTags,
+           [{STag, _SValue} | _SRest] = SetTags, UnsetTags)
+when OTag < STag ->
+  case sets:is_element(OTag, UnsetTags) of
+    true -> merge_tags(ORest, SetTags, UnsetTags);
+    false -> [Old | merge_tags(ORest, SetTags, UnsetTags)]
+  end;
+
+merge_tags([{OTag, _OValue} | ORest] = _OldTags,
+           [{STag, _SValue} | _SRest] = SetTags, UnsetTags)
+when OTag == STag ->
+  merge_tags(ORest, SetTags, UnsetTags);
+
+merge_tags([{OTag, _OValue} | _ORest] = OldTags,
+           [{STag, _SValue} = Set | SRest] = _SetTags, UnsetTags)
+when OTag > STag ->
+  [Set | merge_tags(OldTags, SRest, UnsetTags)].
 
 %%%---------------------------------------------------------------------------
 
