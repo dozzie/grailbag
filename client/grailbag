@@ -388,6 +388,71 @@ class GrailBagServer:
 
     # }}}
     #------------------------------------------------------
+    # GrailBagServer.Upload (context manager) {{{
+
+    class Upload:
+        def __init__(self, chunk_size, id, conn, parent):
+            self.chunk_size = chunk_size
+            self.id = id
+            self._conn = conn
+            self._parent = parent
+            self._ctx = hashlib.sha1() # TODO: change to SHA512
+            self._sizebuf = bytearray(4)
+
+        def __del__(self):
+            if self._ctx is not None and self._parent is not None:
+                # abort the connection
+                self._parent._close()
+            self._parent = None
+            self._conn = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if self._ctx is not None and self._parent is not None:
+                # abort the connection
+                self._parent._close()
+            self._parent = None
+            self._conn = None
+
+        def write(self, data):
+            self._sizebuf[0] = (len(data) >> 24) & 0xff
+            self._sizebuf[1] = (len(data) >> 16) & 0xff
+            self._sizebuf[2] = (len(data) >>  8) & 0xff
+            self._sizebuf[3] = (len(data)      ) & 0xff
+            self._conn.send(self._sizebuf)
+            self._conn.send(data)
+            self._ctx.update(data)
+
+        def done(self):
+            self._conn.send("\x00\x00\x00\x00") # send EOF marker
+            digest = self._ctx.digest()
+            self._ctx = None
+            self._sizebuf[0] = (len(digest) >> 24) & 0xff
+            self._sizebuf[1] = (len(digest) >> 16) & 0xff
+            self._sizebuf[2] = (len(digest) >>  8) & 0xff
+            self._sizebuf[3] = (len(digest)      ) & 0xff
+            self._conn.send(self._sizebuf)
+            self._conn.send(digest)
+
+            reply = self._parent._recv()
+            (tag, info) = reply.start_reading()
+
+            if tag is TAG_OK:
+                artifact_id = reply.uuid()
+
+                if not reply.empty():
+                    raise ProtocolError("unexpected message payload")
+                return
+
+            if tag is TAG_ERROR and info is ERR_CODE_CHECKSUM:
+                raise UploadChecksumMismatch(self.id)
+
+            raise ProtocolError("unexpected reply (tag %s)", tag)
+
+    # }}}
+    #------------------------------------------------------
 
     def __init__(self, host, port = 3255, timeout = 5):
         self.host = host
@@ -468,16 +533,25 @@ class GrailBagServer:
     #------------------------------------------------------
 
     def store(self, artifact_type, tags):
-        # artifact_type: string
-        # tags: {string => string}
-        # return: context manager with `chunk_size' and `artifact_id' fields,
-        # with `write(str)' and `done()' methods
         request = ReqBuffer("S")
         request.add_str16(artifact_type)
         request.add_int32(len(tags))
         for (name, value) in tags.iteritems():
             request.add_pair(name, value)
-        pass # TODO
+
+        reply = self._send(request)
+        (tag, info) = reply.start_reading()
+
+        if tag is TAG_OK_CHUNKSIZE:
+            chunk_size = info
+            artifact_id = reply.uuid()
+
+            if not reply.empty():
+                raise ProtocolError("unexpected message payload")
+            return GrailBagServer.Upload(chunk_size, str(artifact_id),
+                                         self.conn, self)
+
+        raise ProtocolError("unexpected reply (tag %s)", tag)
 
     def delete(self, artifact_id):
         request = ReqBuffer("D")
@@ -688,14 +762,16 @@ def format_artifact_info(info):
 
 def op_store(server, artifact_type, filename, *tags):
     set_tags = dict(t.split("=") for t in tags if "=" in t)
-    with open(filename, "r") as source:
+    source = open(filename, "r") if filename != "-" else sys.stdin
+    with source:
         with server.store(artifact_type, set_tags) as upload:
-            # upload.chunk_size is guaranteed to be at least 4096 bytes
-            # upload.artifact_id
-            chunk = source.read(4096)
+            print "uploading: ID=%s" % (upload.id,)
+            # NOTE: `upload.chunk_size' is guaranteed to be >=4096 bytes
+            chunk_size = 4096
+            chunk = source.read(chunk_size)
             while chunk != "":
                 upload.write(chunk)
-                chunk = source.read(4096)
+                chunk = source.read(chunk_size)
             upload.done()
             print "uploaded"
 
