@@ -10,6 +10,8 @@
 -export([uuid/0, uuid3/2, uuid4/0, uuid5/2]).
 -export([version/1]).
 
+-export_type([uuid/0, namespace/0]).
+
 %%%----------------------------------------------------------------------------
 
 -type uuid() :: binary().
