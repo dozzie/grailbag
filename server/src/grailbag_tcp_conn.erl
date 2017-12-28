@@ -92,7 +92,6 @@ init([Socket] = _Args) ->
     {client, {str, format_address(PeerAddr, PeerPort)}},
     {local_address, {str, format_address(LocalAddr, LocalPort)}}
   ]),
-  grailbag_log:info("new connection"),
   State = #state{
     socket = Socket,
     read_left = undefined,
@@ -106,8 +105,13 @@ init([Socket] = _Args) ->
 
 terminate(_Arg, _State = #state{socket = Socket, handle = Handle}) ->
   case Handle of
-    undefined -> ok;
-    {_, _, H} -> grailbag_artifact:close(H)
+    {upload, ID, H} ->
+      grailbag_log:info("upload aborted", [{artifact, ID}]),
+      grailbag_artifact:close(H);
+    {download, _ID, H} ->
+      grailbag_artifact:close(H);
+    undefined ->
+      ok
   end,
   gen_tcp:close(Socket),
   ok.
@@ -165,8 +169,7 @@ handle_info(timeout = _Message,
         ok ->
           NewState = State#state{read_left = ReadLeft - size(Data)},
           {noreply, NewState, 0};
-        {error, Reason} ->
-          grailbag_log:info("TCP send error", [{error, {term, Reason}}]),
+        {error, _Reason} ->
           {stop, normal, State}
       end;
     eof ->
@@ -252,6 +255,10 @@ handle_info({tcp, Socket, Data} = _Message,
       % TODO: check if the type is known
       case grailbag_artifact:create(Type, Tags) of
         {ok, Handle, ID} ->
+          grailbag_log:info("creating a new artifact", [
+            {operation, store},
+            {artifact, ID}
+          ]),
           % NOTE: socket is and stays in passive state and 4-byte size prefix
           % packet mode
           % XXX: maximum allowed chunk size must be at least 4kB
@@ -277,7 +284,12 @@ handle_info({tcp, Socket, Data} = _Message,
       end;
     {delete, ID} ->
       Reply = case grailbag_reg:delete(ID) of
-        ok -> encode_success(ID);
+        ok ->
+          grailbag_log:info("deleted an artifact", [
+            {operation, store},
+            {artifact, ID}
+          ]),
+          encode_success(ID);
         {error, bad_id} -> encode_error(unknown_artifact);
         {error, artifact_has_tokens} -> encode_error(artifact_has_tokens);
         {error, {storage, EventID}} -> encode_error({server_error, EventID})
@@ -291,7 +303,13 @@ handle_info({tcp, Socket, Data} = _Message,
       end;
     {update_tags, ID, Tags, UnsetTags} ->
       Reply = case grailbag_reg:update_tags(ID, Tags, UnsetTags) of
-        ok -> encode_success(ID);
+        ok ->
+          grailbag_log:info("updated tags of an artifact", [
+            {operation, update_tags},
+            {artifact, ID},
+            {tags, [{set, Tags}, {unset, UnsetTags}]}
+          ]),
+          encode_success(ID);
         {error, bad_id} -> encode_error(unknown_artifact);
         {error, {schema, _, _} = Reason} -> encode_error(Reason);
         {error, {storage, EventID}} -> encode_error({server_error, EventID})
@@ -305,7 +323,13 @@ handle_info({tcp, Socket, Data} = _Message,
       end;
     {update_tokens, ID, Tokens, UnsetTokens} ->
       Reply = case grailbag_reg:update_tokens(ID, Tokens, UnsetTokens) of
-        ok -> encode_success(ID);
+        ok ->
+          grailbag_log:info("updated tokens of an artifact", [
+            {operation, update_tokens},
+            {artifact, ID},
+            {tokens, [{set, Tokens}, {unset, UnsetTokens}]}
+          ]),
+          encode_success(ID);
         {error, bad_id} -> encode_error(unknown_artifact);
         {error, {schema, _} = Reason} -> encode_error(Reason);
         {error, {storage, EventID}} -> encode_error({server_error, EventID})
@@ -397,9 +421,8 @@ handle_info({tcp_closed, Socket} = _Message,
             State = #state{socket = Socket}) ->
   {stop, normal, State};
 
-handle_info({tcp_error, Socket, Reason} = _Message,
+handle_info({tcp_error, Socket, _Reason} = _Message,
             State = #state{socket = Socket}) ->
-  grailbag_log:info("TCP socket closed abnormally", [{error, {term, Reason}}]),
   {stop, normal, State};
 
 %% unknown messages
