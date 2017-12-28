@@ -378,9 +378,13 @@ handle_call({update_tokens, ID, SetTokens, UnsetTokens} = _Request, _From,
           ),
           % remove tokens set to this artifact from the artifacts that kept
           % them previously, both in ETS table and on disk
-          % TODO: handle storage write errors
-          ok = move_tokens(ID, Type, SetTokens),
-          {reply, ok, State};
+          case move_tokens(ID, Type, SetTokens) of
+            ok ->
+              {reply, ok, State};
+            {error, {storage, _EventID} = Reason} ->
+              % the specific errors were already logged
+              {reply, {error, Reason}, State}
+          end;
         {error, Reason} ->
           EventID = grailbag_uuid:uuid(),
           grailbag_log:warn("can't update tokens of an artifact in storage", [
@@ -430,12 +434,11 @@ code_change(_OldVsn, State, _Extra) ->
 
 %% @doc Move tokens that are being set from their previous owners, both
 %%   on-disk and in-memory.
-%%
-%% @todo Don't crash on disk write errors and report them
 
 -spec move_tokens(grailbag:artifact_id(), grailbag:artifact_type(),
                   [grailbag:token()]) ->
-  ok.
+  ok | {error, Reason}
+  when Reason :: {storage, EventID :: grailbag_log:event_id()}.
 
 move_tokens(NewID, Type, Tokens) ->
   % find all artifacts that are affected by moving tokens
@@ -451,26 +454,57 @@ move_tokens(NewID, Type, Tokens) ->
   )),
   % NOTE: `MTime' field in ETS tokens table is not used after boot
   ets:insert(?TOKEN_TABLE, [{{Type, T}, NewID, undefined} || T <- Tokens]),
-  UnsetTokens = sets:from_list(Tokens),
-  lists:foreach(
-    fun(ID) ->
-      [Record] = ets:lookup(?ARTIFACT_TABLE, ID),
-      NewTokens = lists:filter(
-        fun(T) -> not sets:is_element(T, UnsetTokens) end,
-        Record#artifact.tokens
-      ),
-      % TODO: handle write errors
-      {ok, MTime} = grailbag_artifact:update_tokens(ID, NewTokens),
+  case update_disk_storage(UpdateArtifacts, sets:from_list(Tokens), none) of
+    none -> ok;
+    EventID -> {error, {storage, EventID}}
+  end.
+
+%% @doc Workhorse for {@link move_tokens/3}.
+
+-spec update_disk_storage([grailbag:artifact_id()], set(),
+                          none | grailbag_log:event_id()) ->
+  none | grailbag_log:event_id().
+
+update_disk_storage([] = _Artifacts, _UnsetTokens, EventID) ->
+  EventID;
+update_disk_storage([ID | Rest] = _Artifacts, UnsetTokens, EventID) ->
+  [Record = #artifact{tokens = OldTokens}] = ets:lookup(?ARTIFACT_TABLE, ID),
+  {RemovedTokens, NewTokens} = lists:partition(
+    fun(T) -> sets:is_element(T, UnsetTokens) end,
+    OldTokens
+  ),
+  % NOTE: this artifact was selected for update because it had at least one
+  % token to be moved, so `RemovedTokens' is not empty (though if it was
+  % empty, the `grailbag_artifact:update_tokens()' call would be effectively
+  % a disk-writing no-op)
+  case grailbag_artifact:update_tokens(ID, NewTokens) of
+    {ok, MTime} ->
       NewRecord = Record#artifact{
         mtime = MTime,
         tokens = NewTokens
       },
-      ets:insert(?ARTIFACT_TABLE, NewRecord)
-    end,
-    UpdateArtifacts
-  ),
-  % TODO: report write errors
-  ok.
+      ets:insert(?ARTIFACT_TABLE, NewRecord),
+      update_disk_storage(Rest, UnsetTokens, EventID);
+    {error, Reason} ->
+      NewEventID = case EventID of
+        none -> grailbag_uuid:uuid();
+        _ -> EventID
+      end,
+      grailbag_log:warn("can't remove tokens from artifact", [
+        {operation, update_tokens},
+        {error, {term, Reason}},
+        {artifact, ID},
+        {removed_tokens, RemovedTokens},
+        {event_id, {uuid, NewEventID}}
+      ]),
+      NewRecord = Record#artifact{
+        % we don't have a timestamp, so let's make one
+        mtime = grailbag:timestamp(),
+        tokens = NewTokens
+      },
+      ets:insert(?ARTIFACT_TABLE, NewRecord),
+      update_disk_storage(Rest, UnsetTokens, NewEventID)
+  end.
 
 %%%---------------------------------------------------------------------------
 
