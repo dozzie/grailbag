@@ -28,6 +28,7 @@
 -export([reload/1]).
 
 -export_type([event_type/0, event_info/0, event_message/0]).
+-export_type([event_id/0]).
 
 %%%---------------------------------------------------------------------------
 
@@ -37,6 +38,10 @@
 -type event_type() :: atom().
 
 -type event_message() :: string() | binary().
+
+-type event_id() :: grailbag_uuid:uuid().
+%% Identifier used for correlating server errors reported to clients with log
+%% entries.
 
 %%%---------------------------------------------------------------------------
 %%% logging interface
@@ -219,7 +224,10 @@ to_string(Data) ->
 
 -spec struct_or_string(Entry) ->
   indira_json:struct()
-  when Entry :: indira_json:struct() | {term, term()} | {str, string()}.
+  when Entry :: indira_json:struct()
+              | {term, term()}
+              | {str, string()}
+              | {uuid, event_id()}.
 
 struct_or_string({term, Term} = _Entry) ->
   % 4GB line limit should be more than enough to have it in a single line
@@ -227,6 +235,8 @@ struct_or_string({term, Term} = _Entry) ->
 struct_or_string({str, String} = _Entry) ->
   % even if the string is a binary, this will convert it all to a binary
   iolist_to_binary(String);
+struct_or_string({uuid, UUID} = _Entry) when bit_size(UUID) == 128 ->
+  list_to_binary(grailbag_uuid:format(UUID));
 struct_or_string(Entry) ->
   Entry.
 

@@ -22,9 +22,6 @@
 %%%---------------------------------------------------------------------------
 %%% types {{{
 
--define(EVENT_ID_TODO, <<0:128>>).
--define(EVENT_ID_UNIMPLEMENTED, <<16#ffffffffffffffff:64, 16#ffffffffffffffff:64>>).
-
 -define(READ_CHUNK_SIZE, 16384). % 16kB
 
 -record(state, {
@@ -173,12 +170,22 @@ handle_info(timeout = _Message,
           {stop, normal, State}
       end;
     eof ->
-      grailbag_log:warn("artifact read error",
-                        [{artifact, ID}, {error, {term, eof}}]),
+      grailbag_log:warn("artifact read error", [
+        {operation, get},
+        {error, {term, eof}},
+        {artifact, ID}
+      ]),
+      % the client protocol has no way of sending an error, so let's terminate
+      % the connection early
       {stop, normal, State};
     {error, Reason} ->
-      grailbag_log:warn("artifact read error",
-                        [{artifact, ID}, {error, {term, Reason}}]),
+      grailbag_log:warn("artifact read error", [
+        {operation, get},
+        {error, {term, Reason}},
+        {artifact, ID}
+      ]),
+      % the client protocol has no way of sending an error, so let's terminate
+      % the connection early
       {stop, normal, State}
   end;
 
@@ -196,8 +203,11 @@ handle_info({tcp, Socket, Data} = _Message,
           inet:setopts(Socket, [{active, once}]),
           {noreply, State};
         {error, Reason} ->
-          grailbag_log:warn("artifact write error",
-                            [{artifact, ID}, {error, {term, Reason}}]),
+          grailbag_log:warn("artifact write error", [
+            {operation, store},
+            {error, {term, Reason}},
+            {artifact, ID}
+          ]),
           {stop, normal, State}
       end;
     LocalHash == undefined, size(Data) == 0 ->
@@ -231,7 +241,6 @@ handle_info({tcp, Socket, Data} = _Message,
           inet:setopts(Socket, [{active, once}]),
           {noreply, NewState};
         {error, _Reason} ->
-          % TODO: log this error
           {stop, normal, NewState}
       end
   end;
@@ -248,9 +257,15 @@ handle_info({tcp, Socket, Data} = _Message,
           % XXX: maximum allowed chunk size must be at least 4kB
           Reply = encode_success(ID, ?READ_CHUNK_SIZE),
           NewState = State#state{handle = {upload, ID, Handle}};
-        {error, _Reason} ->
-          % TODO: log this error
-          Reply = encode_error({server_error, ?EVENT_ID_TODO}),
+        {error, Reason} ->
+          EventID = grailbag_uuid:uuid(),
+          grailbag_log:warn("can't create a new artifact", [
+            {operation, store},
+            {error, {term, Reason}},
+            {artifact, null},
+            {event_id, {uuid, EventID}}
+          ]),
+          Reply = encode_error({server_error, EventID}),
           NewState = State
       end,
       case gen_tcp:send(Socket, Reply) of
@@ -354,10 +369,16 @@ handle_info({tcp, Socket, Data} = _Message,
           inet:setopts(Socket, [{active, once}]),
           Reply = encode_error(unknown_artifact),
           NewState = State;
-        {error, _Reason} ->
+        {error, Reason} ->
           inet:setopts(Socket, [{active, once}]),
-          % TODO: log this error
-          Reply = encode_error({server_error, ?EVENT_ID_TODO}),
+          EventID = grailbag_uuid:uuid(),
+          grailbag_log:warn("can't open an artifact", [
+            {operation, get},
+            {error, {term, Reason}},
+            {artifact, ID},
+            {event_id, {uuid, EventID}}
+          ]),
+          Reply = encode_error({server_error, EventID}),
           NewState = State
       end,
       case gen_tcp:send(Socket, Reply) of

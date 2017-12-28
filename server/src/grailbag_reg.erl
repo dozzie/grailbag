@@ -27,8 +27,6 @@
 %%%---------------------------------------------------------------------------
 %%% types {{{
 
--define(EVENT_ID_TODO, <<0:128>>).
-
 -define(ARTIFACT_TABLE, grailbag_artifacts).
 -define(TYPE_TABLE, grailbag_artifact_types).
 % NOTE: mtime field in this table is only used during boot
@@ -74,7 +72,7 @@ store(ID, Type, BodySize, BodyHash, CTime, MTime, Tags) ->
   ok | {error, Reason}
   when Reason :: bad_id
                | artifact_has_tokens
-               | {storage, EventID :: binary()}.
+               | {storage, EventID :: grailbag_log:event_id()}.
 
 delete(ID) ->
   gen_server:call(?MODULE, {delete, ID}, infinity).
@@ -87,7 +85,7 @@ delete(ID) ->
   ok | {error, Reason}
   when Reason :: bad_id
                | {schema, Dup :: [grailbag:tag()], Missing :: [grailbag:tag()]}
-               | {storage, EventID :: binary()}.
+               | {storage, EventID :: grailbag_log:event_id()}.
 
 update_tags(ID, SetTags, UnsetTags) ->
   % `SetTags' is expected to be sorted by tag name
@@ -131,7 +129,7 @@ filter_dup_tags(_OldTag, []) ->
   ok | {error, Reason}
   when Reason :: bad_id
                | {schema, Unknown :: [grailbag:token()]}
-               | {storage, EventID :: binary()}.
+               | {storage, EventID :: grailbag_log:event_id()}.
 
 update_tokens(ID, SetTokens, UnsetTokens) ->
   Request = {update_tokens, ID, SetTokens, UnsetTokens},
@@ -304,9 +302,15 @@ handle_call({delete, ID} = _Request, _From, State) ->
       case grailbag_artifact:delete(ID) of
         ok ->
           {reply, ok, State};
-        {error, _Reason} ->
-          % TODO: log this error and return correlation ID
-          {reply, {error, {storage, ?EVENT_ID_TODO}}, State}
+        {error, Reason} ->
+          EventID = grailbag_uuid:uuid(),
+          grailbag_log:warn("can't delete artifact from storage", [
+            {operation, delete},
+            {error, {term, Reason}},
+            {artifact, ID},
+            {event_id, {uuid, EventID}}
+          ]),
+          {reply, {error, {storage, EventID}}, State}
       end;
     [#artifact{tokens = [_|_]}] ->
       {reply, {error, artifact_has_tokens}, State};
@@ -331,9 +335,15 @@ handle_call({update_tags, ID, SetTags, UnsetTags} = _Request, _From,
           },
           ets:insert(?ARTIFACT_TABLE, NewRecord),
           {reply, ok, State};
-        {error, _Reason} ->
-          % TODO: log this error and return correlation ID
-          {reply, {error, {storage, ?EVENT_ID_TODO}}, State}
+        {error, Reason} ->
+          EventID = grailbag_uuid:uuid(),
+          grailbag_log:warn("can't update tags of an artifact in storage", [
+            {operation, update_tags},
+            {error, {term, Reason}},
+            {artifact, ID},
+            {event_id, {uuid, EventID}}
+          ]),
+          {reply, {error, {storage, EventID}}, State}
       end;
     [] ->
       {reply, {error, bad_id}, State}
@@ -371,9 +381,15 @@ handle_call({update_tokens, ID, SetTokens, UnsetTokens} = _Request, _From,
           % TODO: handle storage write errors
           ok = move_tokens(ID, Type, SetTokens),
           {reply, ok, State};
-        {error, _Reason} ->
-          % TODO: log this error and return correlation ID
-          {reply, {error, {storage, ?EVENT_ID_TODO}}, State}
+        {error, Reason} ->
+          EventID = grailbag_uuid:uuid(),
+          grailbag_log:warn("can't update tokens of an artifact in storage", [
+            {operation, update_tokens},
+            {error, {term, Reason}},
+            {artifact, ID},
+            {event_id, {uuid, EventID}}
+          ]),
+          {reply, {error, {storage, EventID}}, State}
       end;
     [] ->
       {reply, {error, bad_id}, State}
