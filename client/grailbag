@@ -26,6 +26,13 @@ parser = optparse.OptionParser(
         "\n  %prog get  <id> <filename>"
 )
 
+# TODO: remove this option once WATCH is implemented server-side
+parser.add_option(
+    "--interval", dest = "interval", type = "int",
+    default = 5,
+    help = "watch interval", metavar = "SECONDS",
+)
+
 parser.add_option(
     "--server", dest = "server",
     default = "localhost:3255",
@@ -884,10 +891,84 @@ def op_get(server, artifact_id, filename):
 
 # }}}
 #------------------------------------------------------
-# WATCH type {{{ (TODO)
+# WATCH type {{{
+
+class ArtifactState:
+    def __init__(self, artifacts):
+        self.artifacts = {}
+        self.tokens = {}
+        for a in artifacts:
+            self.artifacts[a.id] = a
+            for t in a.tokens:
+                self.tokens[t] = a.id
+        self.ids = set(self.artifacts)
 
 def op_watch(server, artifact_type):
-    pass # TODO
+    state = ArtifactState(server.artifacts(artifact_type))
+    # TODO: dump the current state
+    while True:
+        time.sleep(options.interval)
+        old_state = state
+        state = ArtifactState(server.artifacts(artifact_type))
+
+        changes = []
+        # print deleted tokens before any deleted artifacts
+        for token in sorted(old_state.tokens):
+            if token in state.tokens:
+                continue
+            changes.append({
+                "token": token,
+                "old": old_state.tokens[token],
+                "new": None,
+            })
+
+        for aid in old_state.ids - state.ids:
+            changes.append({
+                "state": "deleted",
+                "artifact": aid,
+                #"tags": None,
+            })
+
+        for aid in state.ids - old_state.ids:
+            changes.append({
+                "state": "added",
+                "artifact": aid,
+                "tags": state.artifacts[aid].tags,
+            })
+
+        for aid in old_state.ids & state.ids:
+            old_tags = old_state.artifacts[aid].tags
+            new_tags = state.artifacts[aid].tags
+            token_changes = {
+                tag: new_tags.get(tag)
+                for tag in set(old_tags) | set(new_tags)
+                if old_tags.get(tag) != new_tags.get(tag)
+            }
+            if len(token_changes) > 0:
+                changes.append({
+                    "state": "changed",
+                    "artifact": aid,
+                    "tags": token_changes,
+                })
+
+        # new tokens and moved tokens (deleted ones were printed earlier)
+        for token in sorted(state.tokens):
+            old_id = old_state.tokens.get(token)
+            new_id = state.tokens[token]
+            if old_id != new_id:
+                changes.append({
+                    "token": token,
+                    "old": old_id,
+                    "new": new_id,
+                })
+
+        if len(changes) > 0:
+            now = int(time.time())
+            for m in changes:
+                m["time"] = now
+                sys.stdout.write(json.dumps(m, sort_keys = True))
+                sys.stdout.write("\n")
+            sys.stdout.flush()
 
 # }}}
 #------------------------------------------------------
