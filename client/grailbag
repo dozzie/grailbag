@@ -1004,6 +1004,8 @@ try:
 except GrailBagException as e:
     print >>sys.stderr, str(e)
     sys.exit(255)
+except KeyboardInterrupt:
+    sys.exit(0)
 
 if isinstance(ret, (int, long)):
     sys.exit(ret)
