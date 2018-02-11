@@ -378,8 +378,7 @@ handle_info({tcp, Socket, Data} = _Message,
     {get, ID} -> % potentially long running connection
       case grailbag_artifact:open(ID) of
         {ok, Handle} ->
-          {ok, {_ID, _Type, FileSize, _Hash, _CTime, _MTime, _Tags, _Tokens} = Info} =
-            grailbag_artifact:info(Handle),
+          {ok, {_, _, FileSize, _, _, _, _, _} = Info} = grailbag_reg:info(ID),
           RawReply = encode_info(Info),
           % we won't be reading for a while, and sending should not add any
           % data (`{packet,4}' adds 4 bytes of packet length)

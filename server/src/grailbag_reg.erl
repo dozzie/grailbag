@@ -32,6 +32,8 @@
 % NOTE: mtime field in this table is only used during boot
 -define(TOKEN_TABLE, grailbag_artifact_tokens).
 
+-define(TOKEN_DB_FILE, "tokens.db").
+
 -record(artifact, {
   id :: grailbag:artifact_id(),
   type :: grailbag:artifact_type(),
@@ -43,7 +45,9 @@
   tokens :: [grailbag:token()]
 }).
 
--record(state, {}).
+-record(state, {
+  tokens :: grailbag_tokendb:handle()
+}).
 
 %%% }}}
 %%%---------------------------------------------------------------------------
@@ -207,14 +211,19 @@ init(_Args) ->
   ets:new(?ARTIFACT_TABLE,
           [set, named_table, protected, {keypos, #artifact.id}]),
   ets:new(?TYPE_TABLE, [bag, named_table, protected]),
-  % `{{Type,Token}, ID, MTime}'
-  ets:new(?TOKEN_TABLE, [set, named_table, protected]),
-  lists:foreach(fun ets_add_artifact/1, grailbag_artifact:list()),
-  grailbag_log:info("starting artifact registry", [
-    {artifacts, ets:info(?ARTIFACT_TABLE, size)}
-  ]),
-  State = #state{},
-  {ok, State}.
+  {ok, DataDir} = application:get_env(data_dir),
+  case grailbag_tokendb:open(filename:join(DataDir, ?TOKEN_DB_FILE)) of
+    {ok, Handle} ->
+      lists:foreach(fun ets_add_artifact/1, grailbag_artifact:list()),
+      dict:fold(fun ets_add_tokens/3, ignore, build_tokens_mapping(Handle)),
+      grailbag_log:info("starting artifact registry", [
+        {artifacts, ets:info(?ARTIFACT_TABLE, size)}
+      ]),
+      State = #state{tokens = Handle},
+      {ok, State};
+    {error, Reason} ->
+      {stop, {open_tokens_db, Reason}}
+  end.
 
 %% @doc Helper to add an artifact to ETS tables during boot ({@link init/1}).
 
@@ -223,58 +232,45 @@ init(_Args) ->
 
 ets_add_artifact(ID) ->
   case grailbag_artifact:info(ID) of
-    {ok, {ID, Type, Size, Hash, CTime, MTime, Tags, Tokens}} ->
+    {ok, {ID, Type, _Size, _Hash, _CTime, _MTime, _Tags, _Tokens} = Info} ->
       % TODO: filter unique tags
-      NewTokens = filter_duplicate_tokens(Type, ID, MTime, Tokens),
-      ets:insert(?TOKEN_TABLE, [{{Type, T}, ID, MTime} || T <- NewTokens]),
-      NewInfo = {ID, Type, Size, Hash, CTime, MTime, Tags, NewTokens},
-      ets:insert(?ARTIFACT_TABLE, make_record(NewInfo)),
+      ets:insert(?ARTIFACT_TABLE, make_record(Info)),
       ets:insert(?TYPE_TABLE, {Type, ID});
     undefined ->
       ok
   end.
 
-%% @doc {@link ets_add_artifact/1} helper to keep duplicates off of ETS tokens
-%%   table.
+%% @doc Build a dictionary with all tokens for all artifacts.
+%%
+%% @see ets_add_tokens/3
 
--spec filter_duplicate_tokens(grailbag:artifact_type(), grailbag:artifact_id(),
-                              grailbag:mtime(), [grailbag:token()]) ->
-  [grailbag:token()].
+build_tokens_mapping(Handle) ->
+  lists:foldl(
+    fun({ID, _Type, Token}, Acc) ->
+      dict:update(ID, fun(TokenList) -> [Token | TokenList] end, [Token], Acc)
+    end,
+    dict:new(),
+    grailbag_tokendb:tokens(Handle)
+  ).
 
-filter_duplicate_tokens(_Type, _ID, _MTime, [] = _Tokens) ->
-  [];
-filter_duplicate_tokens(Type, ID, MTime, [T | Rest] = _Tokens) ->
-  case ets:lookup(?TOKEN_TABLE, {Type, T}) of
-    [] ->
-      [T | filter_duplicate_tokens(Type, ID, MTime, Rest)];
-    % XXX: the clauses below are only relevant when a crash occurred during
-    % moving a token
-    [{{Type, T}, OtherID, OtherMTime}] when OtherMTime < MTime ->
-      ets_remove_token(OtherID, T),
-      [T | filter_duplicate_tokens(Type, ID, MTime, Rest)];
-    [{{Type, T}, _OtherID, OtherMTime}] when OtherMTime >= MTime ->
-      filter_duplicate_tokens(Type, ID, MTime, Rest)
-  end.
+%% @doc Set tokens in ETS table for an artifact.
+%%
+%%   Suitable as {@link dict:fold/3} callback function for data returned by
+%%   {@link build_tokens_mapping/1}.
+%%
+%% @see build_tokens_mapping/1
 
-%% @doc {@link filter_duplicate_tokens/3} helper to remove duplicate tokens
-%%   from an artifact record in ETS table.
-
--spec ets_remove_token(grailbag:artifact_id(), grailbag:token()) ->
-  any().
-
-ets_remove_token(ID, Token) ->
-  [#artifact{tokens = Tokens} = Record] = ets:lookup(?ARTIFACT_TABLE, ID),
-  NewTokens = lists:delete(Token, Tokens),
-  NewRecord = Record#artifact{tokens = NewTokens},
-  ets:insert(?ARTIFACT_TABLE, NewRecord).
+ets_add_tokens(ID, Tokens, _Acc) ->
+  ets:update_element(?ARTIFACT_TABLE, ID,
+                     {#artifact.tokens, lists:sort(Tokens)}).
 
 %% @private
 %% @doc Clean up {@link gen_server} state.
 
-terminate(_Arg, _State) ->
+terminate(_Arg, _State = #state{tokens = Handle}) ->
+  grailbag_tokendb:close(Handle),
   ets:delete(?ARTIFACT_TABLE),
   ets:delete(?TYPE_TABLE),
-  ets:delete(?TOKEN_TABLE),
   ok.
 
 %% }}}
@@ -327,7 +323,7 @@ handle_call({update_tags, ID, SetTags, UnsetTags} = _Request, _From,
       % function)
       NewTags = merge_tags(OldTags, SetTags, sets:from_list(UnsetTags)),
       % TODO: verify `NewTags' against schema
-      case grailbag_artifact:update_tags(ID, NewTags) of
+      case grailbag_artifact:update(ID, NewTags) of
         {ok, MTime} ->
           NewRecord = Record#artifact{
             mtime = MTime,
@@ -350,50 +346,22 @@ handle_call({update_tags, ID, SetTags, UnsetTags} = _Request, _From,
   end;
 
 handle_call({update_tokens, ID, SetTokens, UnsetTokens} = _Request, _From,
-            State) ->
+            State = #state{tokens = Handle}) ->
   case ets:lookup(?ARTIFACT_TABLE, ID) of
-    [#artifact{type = Type, tokens = OldTokens} = Record] ->
-      FilterSet = sets:from_list(UnsetTokens),
-      NewTokens = lists:usort(
-        SetTokens ++
-        lists:filter(fun(T) -> not sets:is_element(T, FilterSet) end, OldTokens)
-      ),
-      % TODO: verify `NewTokens' against schema
-      case grailbag_artifact:update_tokens(ID, NewTokens) of
-        {ok, MTime} ->
-          NewRecord = Record#artifact{
-            mtime = MTime,
-            tokens = NewTokens
-          },
-          ets:insert(?ARTIFACT_TABLE, NewRecord),
-          % delete the unset tokens from the ETS tokens table
-          lists:foreach(
-            fun(T) ->
-              case ets:lookup(?TOKEN_TABLE, {Type, T}) of
-                [{_, ID, _}] -> ets:delete(?TOKEN_TABLE, {Type, T});
-                _ -> ok % either no entry or not this ID
-              end
-            end,
-            UnsetTokens
-          ),
-          % remove tokens set to this artifact from the artifacts that kept
-          % them previously, both in ETS table and on disk
-          case move_tokens(ID, Type, SetTokens) of
-            ok ->
-              {reply, ok, State};
-            {error, {storage, _EventID} = Reason} ->
-              % the specific errors were already logged
-              {reply, {error, Reason}, State}
-          end;
-        {error, Reason} ->
-          EventID = grailbag_uuid:uuid(),
-          grailbag_log:warn("can't update tokens of an artifact in storage", [
-            {operation, update_tokens},
-            {error, {term, Reason}},
-            {artifact, ID},
-            {event_id, {uuid, EventID}}
-          ]),
-          {reply, {error, {storage, EventID}}, State}
+    [#artifact{type = Type, tokens = OldTokens}] ->
+      % TODO: verify `SetTokens' against schema
+      OldSet = sets:from_list(OldTokens),
+      % only the tokens that will actually be deleted from this artifact
+      DelSet = sets:intersection(OldSet, sets:from_list(UnsetTokens)),
+      ets:update_element(?ARTIFACT_TABLE, ID, {#artifact.tokens,
+        lists:usort(SetTokens ++ sets:to_list(sets:subtract(OldSet, DelSet)))
+      }),
+      case move_tokens(ID, Type, Handle, SetTokens, sets:to_list(DelSet)) of
+        ok ->
+          {reply, ok, State};
+        {error, {storage, _EventID} = Reason} ->
+          % the specific errors were already logged
+          {reply, {error, Reason}, State}
       end;
     [] ->
       {reply, {error, bad_id}, State}
@@ -436,75 +404,60 @@ code_change(_OldVsn, State, _Extra) ->
 %%   on-disk and in-memory.
 
 -spec move_tokens(grailbag:artifact_id(), grailbag:artifact_type(),
-                  [grailbag:token()]) ->
+                  grailbag_tokendb:handle(),
+                  [grailbag:token()], [grailbag:token()]) ->
   ok | {error, Reason}
   when Reason :: {storage, EventID :: grailbag_log:event_id()}.
 
-move_tokens(NewID, Type, Tokens) ->
-  % find all artifacts that are affected by moving tokens
+move_tokens(NewID, Type, Handle, ToSet, ToDelete) ->
+  ets_delete_tokens(Handle, Type, NewID, ToSet),
+  % TODO: handle write errors
+  lists:foreach(
+    fun(T) -> grailbag_tokendb:update(Handle, Type, T, NewID) end,
+    ToSet
+  ),
+  % TODO: handle write errors
+  lists:foreach(
+    fun(T) -> grailbag_tokendb:delete(Handle, Type, T) end,
+    ToDelete
+  ),
+  % TODO: report errors
+  ok.
+
+%% @doc Delete tokens that are being set for an artifact from all previous
+%%   owners.
+
+-spec ets_delete_tokens(grailbag_tokendb:handle(), grailbag:artifact_type(),
+                        grailbag:artifact_id(), [grailbag:token()]) ->
+  any().
+
+ets_delete_tokens(Handle, Type, NewID, Tokens) ->
   UpdateArtifacts = lists:usort(lists:foldl(
     fun(T, Acc) ->
-      case ets:lookup(?TOKEN_TABLE, {Type, T}) of
-        [{_, OldID, _MTime}] when OldID /= NewID -> [OldID | Acc];
-        _ -> Acc
+      case grailbag_tokendb:id(Handle, Type, T) of
+        {ok, ID} when ID /= NewID -> [ID | Acc];
+        {ok, NewID} -> Acc;
+        undefined -> Acc
       end
     end,
     [],
     Tokens
   )),
-  % NOTE: `MTime' field in ETS tokens table is not used after boot
-  ets:insert(?TOKEN_TABLE, [{{Type, T}, NewID, undefined} || T <- Tokens]),
-  case update_disk_storage(UpdateArtifacts, sets:from_list(Tokens), none) of
-    none -> ok;
-    EventID -> {error, {storage, EventID}}
-  end.
-
-%% @doc Workhorse for {@link move_tokens/3}.
-
--spec update_disk_storage([grailbag:artifact_id()], set(),
-                          none | grailbag_log:event_id()) ->
-  none | grailbag_log:event_id().
-
-update_disk_storage([] = _Artifacts, _UnsetTokens, EventID) ->
-  EventID;
-update_disk_storage([ID | Rest] = _Artifacts, UnsetTokens, EventID) ->
-  [Record = #artifact{tokens = OldTokens}] = ets:lookup(?ARTIFACT_TABLE, ID),
-  {RemovedTokens, NewTokens} = lists:partition(
-    fun(T) -> sets:is_element(T, UnsetTokens) end,
-    OldTokens
-  ),
-  % NOTE: this artifact was selected for update because it had at least one
-  % token to be moved, so `RemovedTokens' is not empty (though if it was
-  % empty, the `grailbag_artifact:update_tokens()' call would be effectively
-  % a disk-writing no-op)
-  case grailbag_artifact:update_tokens(ID, NewTokens) of
-    {ok, MTime} ->
-      NewRecord = Record#artifact{
-        mtime = MTime,
-        tokens = NewTokens
-      },
-      ets:insert(?ARTIFACT_TABLE, NewRecord),
-      update_disk_storage(Rest, UnsetTokens, EventID);
-    {error, Reason} ->
-      NewEventID = case EventID of
-        none -> grailbag_uuid:uuid();
-        _ -> EventID
-      end,
-      grailbag_log:warn("can't remove tokens from artifact", [
-        {operation, update_tokens},
-        {error, {term, Reason}},
-        {artifact, ID},
-        {removed_tokens, RemovedTokens},
-        {event_id, {uuid, NewEventID}}
-      ]),
-      NewRecord = Record#artifact{
-        % we don't have a timestamp, so let's make one
-        mtime = grailbag:timestamp(),
-        tokens = NewTokens
-      },
-      ets:insert(?ARTIFACT_TABLE, NewRecord),
-      update_disk_storage(Rest, UnsetTokens, NewEventID)
-  end.
+  FilterSet = sets:from_list(Tokens),
+  FilterPred = fun(T) -> not sets:is_element(T, FilterSet) end,
+  lists:foreach(
+    fun(ID) ->
+      case ets:lookup(?ARTIFACT_TABLE, ID) of
+        [#artifact{tokens = OldTokens}] ->
+          NewTokens = lists:filter(FilterPred, OldTokens),
+          ets:update_element(?ARTIFACT_TABLE, ID,
+                             {#artifact.tokens, NewTokens});
+        [] ->
+          ignore
+      end
+    end,
+    UpdateArtifacts
+  ).
 
 %%%---------------------------------------------------------------------------
 
