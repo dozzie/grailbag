@@ -12,7 +12,7 @@
 -behaviour(gen_server).
 
 %% public interface
--export([store/7, delete/1]).
+-export([check_tags/2, store/7, delete/1]).
 -export([update_tags/3, update_tokens/3]).
 -export([list/0, list/1, info/1]).
 
@@ -53,6 +53,16 @@
 %%%---------------------------------------------------------------------------
 %%% public interface
 %%%---------------------------------------------------------------------------
+
+%% @doc Check for collisions and missing tags before accepting upload of
+%%   artifact's body.
+
+-spec check_tags(grailbag:artifact_type(),
+                 [{grailbag:tag(), grailbag:tag_value()}]) ->
+  ok | {error, [grailbag_schema:schema_error()]}.
+
+check_tags(Type, Tags) ->
+  grailbag_schema:verify(grailbag_schema:changes(Type, Tags, [])).
 
 %% @doc Record a completely uploaded artifact in registry.
 %%
@@ -208,14 +218,17 @@ start_link() ->
 
 init(_Args) ->
   grailbag_log:set_context(artifacts, []),
+  grailbag_schema:open(),
   ets:new(?ARTIFACT_TABLE,
           [set, named_table, protected, {keypos, #artifact.id}]),
   ets:new(?TYPE_TABLE, [bag, named_table, protected]),
   {ok, DataDir} = application:get_env(data_dir),
   case grailbag_tokendb:open(filename:join(DataDir, ?TOKEN_DB_FILE)) of
     {ok, Handle} ->
+      grailbag_log:info("loading artifacts and schema"),
       lists:foreach(fun ets_add_artifact/1, grailbag_artifact:list()),
       dict:fold(fun ets_add_tokens/3, ignore, build_tokens_mapping(Handle)),
+      reload_schema(),
       grailbag_log:info("starting artifact registry", [
         {artifacts, ets:info(?ARTIFACT_TABLE, size)}
       ]),
@@ -269,6 +282,7 @@ ets_add_tokens(ID, Tokens, _Acc) ->
 
 terminate(_Arg, _State = #state{tokens = Handle}) ->
   grailbag_tokendb:close(Handle),
+  grailbag_schema:close(),
   ets:delete(?ARTIFACT_TABLE),
   ets:delete(?TYPE_TABLE),
   ok.
@@ -280,10 +294,17 @@ terminate(_Arg, _State = #state{tokens = Handle}) ->
 %% @private
 %% @doc Handle {@link gen_server:call/2}.
 
-handle_call({store, {ID, Type, _Size, _Hash, _CTime, _MTime, _Tags, []} = Info} = _Request,
+handle_call({store, {ID, Type, _Size, _Hash, _CTime, _MTime, Tags, []} = Info} = _Request,
             _From, State) ->
+  % TODO: move inserting record under successful verification
+  Changes = grailbag_schema:changes(Type, Tags, []),
+  case grailbag_schema:verify(Changes) of
+    ok -> ok;
+    {error, Errors} -> lists:foreach(fun(E) -> log_error(ID, E) end, Errors)
+  end,
   case ets:insert_new(?ARTIFACT_TABLE, make_record(Info)) of
     true ->
+      grailbag_schema:store(Changes),
       ets:insert(?TYPE_TABLE, {Type, ID}),
       {reply, ok, State};
     false ->
@@ -292,9 +313,10 @@ handle_call({store, {ID, Type, _Size, _Hash, _CTime, _MTime, _Tags, []} = Info} 
 
 handle_call({delete, ID} = _Request, _From, State) ->
   case ets:lookup(?ARTIFACT_TABLE, ID) of
-    [#artifact{type = Type, tokens = []}] ->
+    [#artifact{type = Type, tags = OldTags, tokens = []}] ->
       ets:delete_object(?TYPE_TABLE, {Type, ID}),
       ets:delete(?ARTIFACT_TABLE, ID),
+      grailbag_schema:delete(Type, OldTags),
       case grailbag_artifact:delete(ID) of
         ok ->
           {reply, ok, State};
@@ -318,11 +340,16 @@ handle_call({update_tags, ID, SetTags, UnsetTags} = _Request, _From,
             State) ->
   % NOTE: `SetTags' is sorted by the tag name (see `update_tags()' function)
   case ets:lookup(?ARTIFACT_TABLE, ID) of
-    [#artifact{tags = OldTags} = Record] ->
+    [#artifact{type = Type, tags = OldTags} = Record] ->
       % NOTE: `OldTags' is sorted by the tag name (see `make_record()'
       % function)
       NewTags = merge_tags(OldTags, SetTags, sets:from_list(UnsetTags)),
-      % TODO: verify `NewTags' against schema
+      % TODO: move updating record under successful verification
+      Changes = grailbag_schema:changes(Type, NewTags, OldTags),
+      case grailbag_schema:verify(Changes) of
+        ok -> ok;
+        {error, Errors} -> lists:foreach(fun(E) -> log_error(ID, E) end, Errors)
+      end,
       case grailbag_artifact:update(ID, NewTags) of
         {ok, MTime} ->
           NewRecord = Record#artifact{
@@ -330,6 +357,7 @@ handle_call({update_tags, ID, SetTags, UnsetTags} = _Request, _From,
             tags = NewTags
           },
           ets:insert(?ARTIFACT_TABLE, NewRecord),
+          grailbag_schema:store(Changes),
           {reply, ok, State};
         {error, Reason} ->
           EventID = grailbag_uuid:uuid(),
@@ -349,7 +377,12 @@ handle_call({update_tokens, ID, SetTokens, UnsetTokens} = _Request, _From,
             State = #state{tokens = Handle}) ->
   case ets:lookup(?ARTIFACT_TABLE, ID) of
     [#artifact{type = Type, tokens = OldTokens}] ->
-      % TODO: verify `SetTokens' against schema
+      % XXX: allow unsetting any token, but setting only a known one
+      % TODO: move updating record under successful verification
+      case grailbag_schema:verify_tokens(Type, SetTokens) of
+        ok -> ok;
+        {error, Errors} -> lists:foreach(fun(E) -> log_error(ID, E) end, Errors)
+      end,
       OldSet = sets:from_list(OldTokens),
       % only the tokens that will actually be deleted from this artifact
       DelSet = sets:intersection(OldSet, sets:from_list(UnsetTokens)),
@@ -513,6 +546,47 @@ make_record({ID, Type, Size, Hash, CTime, MTime, Tags, Tokens} = _Info) ->
     tags = lists:keysort(1, Tags),
     tokens = lists:sort(Tokens)
   }.
+
+%%%---------------------------------------------------------------------------
+
+%% @doc Rebuild schema validation counters ({@link grailbag_schema}) from
+%%   artifact inventory table.
+
+-spec reload_schema() ->
+  ok | error.
+
+reload_schema() ->
+  {ok, Schema} = application:get_env(schema),
+  ReloadContext = ets:foldl(
+    fun(#artifact{id = ID, type = Type, tags = Tags, tokens = Tokens}, Acc) ->
+      grailbag_schema:add_artifact(ID, Type, Tags, Tokens, Acc)
+    end,
+    grailbag_schema:reload(Schema),
+    ?ARTIFACT_TABLE
+  ),
+  grailbag_schema:save(ReloadContext),
+  case grailbag_schema:errors(ReloadContext) of
+    [] ->
+      ok;
+    [_|_] = Errors ->
+      lists:foreach(fun({ID, Error}) -> log_error(ID, Error) end, Errors),
+      error
+  end.
+
+%% @doc Log a schema error.
+
+-spec log_error(grailbag:artifact_id(), grailbag_schema:schema_error()) ->
+  ok.
+
+log_error(ID, {unknown_type, Type} = _Error) ->
+  grailbag_log:info("unknown artifact type", [{artifact, ID}, {type, Type}]);
+log_error(ID, {missing, Tag} = _Error) ->
+  grailbag_log:info("missing mandatory tag", [{artifact, ID}, {tag, Tag}]);
+log_error(ID, {duplicate, Tag, Value} = _Error) ->
+  grailbag_log:info("duplicate value of a unique tag",
+                    [{artifact, ID}, {tag, Tag}, {value, Value}]);
+log_error(ID, {unknown_token, Token} = _Error) ->
+  grailbag_log:info("unknown token", [{artifact, ID}, {token, Token}]).
 
 %%%---------------------------------------------------------------------------
 %%% vim:ft=erlang:foldmethod=marker
