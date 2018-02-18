@@ -568,6 +568,12 @@ class GrailBagServer:
             return GrailBagServer.Upload(chunk_size, str(artifact_id),
                                          self.conn, self)
 
+        if tag is TAG_ERROR and info is ERR_CODE_NXTYPE:
+            raise UnknownType(artifact_type)
+
+        if tag is TAG_ERROR and info is ERR_CODE_SCHEMA:
+            raise SchemaError() # TODO: more error information
+
         raise ProtocolError("unexpected reply (tag %s)", tag)
 
     def delete(self, artifact_id):
