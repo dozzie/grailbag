@@ -7,7 +7,7 @@
 
 %% public interface
 -export([open/0, close/0]).
--export([known_type/1]).
+-export([types/0, known_type/1]).
 -export([changes/3, verify/1, store/1, store/2, delete/2]).
 -export([verify/2, verify_tokens/2]).
 -export([reload/1, add_artifact/5, save/1, errors/1]).
@@ -24,10 +24,10 @@
 
 -record(schema, {
   % XXX: keep `#schema.type' at the same position as `#counter.key'
-  type :: grailbag:artifact_type(),
-  mandatory :: [grailbag:tag()],
-  unique :: [grailbag:tag()],
-  tokens :: [grailbag:token()]
+  type :: grailbag:artifact_type()  | '$1',
+  mandatory :: [grailbag:tag()]     | '_',
+  unique :: [grailbag:tag()]        | '_',
+  tokens :: [grailbag:token()]      | '_'
 }).
 
 -record(counter, {
@@ -87,6 +87,17 @@ close() ->
 
 %%%---------------------------------------------------------------------------
 %%% regular access
+
+%% @doc List known artifact types.
+
+-spec types() ->
+  [grailbag:artifact_type()].
+
+types() ->
+  lists:sort([
+    Type ||
+    [Type] <- ets:match(?ETS_TABLE, {schema, '$1', '_', '_', '_'})
+  ]).
 
 %% @doc Check if a type of artifact is known (has a schema).
 

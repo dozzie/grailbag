@@ -233,8 +233,17 @@ handle_info({tcp, Socket, Data} = _Message,
       },
       Reply = case (Data == LocalHash) of
         true ->
-          grailbag_reg:store(ID, Type, Size, LocalHash, CTime, MTime, Tags),
-          encode_success(ID);
+          case grailbag_reg:store(ID, Type, Size, LocalHash, CTime, MTime, Tags) of
+            ok ->
+              encode_success(ID);
+            %{error, duplicate_id} -> % this should never happen
+            {error, unknown_type} ->
+              grailbag_artifact:delete(ID), % let's hope that delete succeeds
+              encode_error(unknown_type);
+            {error, {schema, _, _} = Reason} ->
+              grailbag_artifact:delete(ID), % let's hope that delete succeeds
+              encode_error(Reason)
+          end;
         false ->
           grailbag_artifact:delete(ID), % let's hope that delete succeeds
           encode_error(body_checksum_mismatch)
@@ -252,27 +261,35 @@ handle_info({tcp, Socket, Data} = _Message,
             State = #state{socket = Socket, handle = undefined}) ->
   case decode_request(Data) of
     {store, Type, Tags} -> % long running connection
-      % TODO: check if the type is known
-      case grailbag_artifact:create(Type, Tags) of
-        {ok, Handle, ID} ->
-          grailbag_log:info("creating a new artifact", [
-            {operation, store},
-            {artifact, ID}
-          ]),
-          % NOTE: socket is and stays in passive state and 4-byte size prefix
-          % packet mode
-          % XXX: maximum allowed chunk size must be at least 4kB
-          Reply = encode_success(ID, ?READ_CHUNK_SIZE),
-          NewState = State#state{handle = {upload, ID, Handle}};
-        {error, Reason} ->
-          EventID = grailbag_uuid:uuid(),
-          grailbag_log:warn("can't create a new artifact", [
-            {operation, store},
-            {error, {term, Reason}},
-            {artifact, null},
-            {event_id, {uuid, EventID}}
-          ]),
-          Reply = encode_error({server_error, EventID}),
+      case grailbag_reg:check_tags(Type, Tags) of
+        ok ->
+          case grailbag_artifact:create(Type, Tags) of
+            {ok, Handle, ID} ->
+              grailbag_log:info("creating a new artifact", [
+                {operation, store},
+                {artifact, ID}
+              ]),
+              % NOTE: socket is and stays in passive state and 4-byte size
+              % prefix packet mode
+              % XXX: maximum allowed chunk size must be at least 4kB
+              Reply = encode_success(ID, ?READ_CHUNK_SIZE),
+              NewState = State#state{handle = {upload, ID, Handle}};
+            {error, Reason} ->
+              EventID = grailbag_uuid:uuid(),
+              grailbag_log:warn("can't create a new artifact", [
+                {operation, store},
+                {error, {term, Reason}},
+                {artifact, null},
+                {event_id, {uuid, EventID}}
+              ]),
+              Reply = encode_error({server_error, EventID}),
+              NewState = State
+          end;
+        {error, unknown_type} ->
+          Reply = encode_error(unknown_type),
+          NewState = State;
+        {error, {schema, _, _} = Reason} ->
+          Reply = encode_error(Reason),
           NewState = State
       end,
       case gen_tcp:send(Socket, Reply) of
@@ -311,6 +328,7 @@ handle_info({tcp, Socket, Data} = _Message,
           ]),
           encode_success(ID);
         {error, bad_id} -> encode_error(unknown_artifact);
+        {error, unknown_type} -> encode_error(unknown_type);
         {error, {schema, _, _} = Reason} -> encode_error(Reason);
         {error, {storage, EventID}} -> encode_error({server_error, EventID})
       end,
@@ -331,6 +349,7 @@ handle_info({tcp, Socket, Data} = _Message,
           ]),
           encode_success(ID);
         {error, bad_id} -> encode_error(unknown_artifact);
+        {error, unknown_type} -> encode_error(unknown_type);
         {error, {schema, _} = Reason} -> encode_error(Reason);
         {error, {storage, EventID}} -> encode_error({server_error, EventID})
       end,
@@ -352,9 +371,10 @@ handle_info({tcp, Socket, Data} = _Message,
           {stop, normal, State}
       end;
     {list, Type} ->
-      % TODO: check if the type is known
-      Artifacts = grailbag_reg:list(Type),
-      Reply = encode_list(Artifacts),
+      Reply = case grailbag_reg:known_type(Type) of
+        true -> encode_list(grailbag_reg:list(Type));
+        false -> encode_error(unknown_type)
+      end,
       case gen_tcp:send(Socket, Reply) of
         ok ->
           inet:setopts(Socket, [{active, once}]),
@@ -364,6 +384,7 @@ handle_info({tcp, Socket, Data} = _Message,
       end;
     % TODO: `{watch, Type, ...}' (long running)
     {info, ID} ->
+      % TODO: check if the artifact conforms to its schema
       Reply = case grailbag_reg:info(ID) of
         {ok, Info} -> encode_info(Info);
         undefined -> encode_error(unknown_artifact)
@@ -376,6 +397,7 @@ handle_info({tcp, Socket, Data} = _Message,
           {stop, normal, State}
       end;
     {get, ID} -> % potentially long running connection
+      % TODO: check if the artifact conforms to its schema
       case grailbag_artifact:open(ID) of
         {ok, Handle} ->
           {ok, {_, _, FileSize, _, _, _, _, _} = Info} = grailbag_reg:info(ID),

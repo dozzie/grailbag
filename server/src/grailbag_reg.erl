@@ -12,7 +12,7 @@
 -behaviour(gen_server).
 
 %% public interface
--export([check_tags/2, store/7, delete/1]).
+-export([known_type/1, check_tags/2, store/7, delete/1]).
 -export([update_tags/3, update_tokens/3]).
 -export([list/0, list/1, info/1]).
 
@@ -54,15 +54,34 @@
 %%% public interface
 %%%---------------------------------------------------------------------------
 
+%% @doc Check if an artifact type is a known one.
+
+-spec known_type(grailbag:artifact_type()) ->
+  boolean().
+
+known_type(Type) ->
+  grailbag_schema:known_type(Type).
+
 %% @doc Check for collisions and missing tags before accepting upload of
 %%   artifact's body.
 
 -spec check_tags(grailbag:artifact_type(),
                  [{grailbag:tag(), grailbag:tag_value()}]) ->
-  ok | {error, [grailbag_schema:schema_error()]}.
+  ok | {error, Reason}
+  when Reason :: unknown_type
+               | {schema, Dup :: [grailbag:tag()], Missing :: [grailbag:tag()]}.
 
 check_tags(Type, Tags) ->
-  grailbag_schema:verify(grailbag_schema:changes(Type, Tags, [])).
+  case grailbag_schema:verify(grailbag_schema:changes(Type, Tags, [])) of
+    ok ->
+      ok;
+    {error, [{unknown_type, _}]} ->
+      {error, unknown_type};
+    {error, Errors} ->
+      Duplicates = lists:usort([T || {duplicate, T, _V} <- Errors]),
+      Missing = lists:usort([T || {missing, T} <- Errors]),
+      {error, {schema, Duplicates, Missing}}
+  end.
 
 %% @doc Record a completely uploaded artifact in registry.
 %%
@@ -74,7 +93,10 @@ check_tags(Type, Tags) ->
 -spec store(grailbag:artifact_id(), grailbag:artifact_type(), non_neg_integer(),
             grailbag:body_hash(), grailbag:ctime(), grailbag:mtime(),
             [{grailbag:tag(), grailbag:tag_value()}]) ->
-  ok | {error, duplicate_id}.
+  ok | {error, Reason}
+  when Reason :: duplicate_id
+               | unknown_type
+               | {schema, Dup :: [grailbag:tag()], Missing :: [grailbag:tag()]}.
 
 store(ID, Type, BodySize, BodyHash, CTime, MTime, Tags) ->
   ArtifactInfo = {ID, Type, BodySize, BodyHash, CTime, MTime, Tags, []},
@@ -98,6 +120,7 @@ delete(ID) ->
                   [grailbag:tag()]) ->
   ok | {error, Reason}
   when Reason :: bad_id
+               | unknown_type
                | {schema, Dup :: [grailbag:tag()], Missing :: [grailbag:tag()]}
                | {storage, EventID :: grailbag_log:event_id()}.
 
@@ -142,6 +165,7 @@ filter_dup_tags(_OldTag, []) ->
                     [grailbag:token()]) ->
   ok | {error, Reason}
   when Reason :: bad_id
+               | unknown_type
                | {schema, Unknown :: [grailbag:token()]}
                | {storage, EventID :: grailbag_log:event_id()}.
 
@@ -150,14 +174,12 @@ update_tokens(ID, SetTokens, UnsetTokens) ->
   gen_server:call(?MODULE, Request, infinity).
 
 %% @doc List known artifact types.
-%%
-%% @todo Consult loaded schema instead of known artifacts
 
 -spec list() ->
   [grailbag:artifact_type()].
 
 list() ->
-  lists:usort([Type || {Type, _ID} <- ets:tab2list(?TYPE_TABLE)]).
+  grailbag_schema:types().
 
 %% @doc List metadata of all artifacts of specific type.
 
@@ -246,7 +268,6 @@ init(_Args) ->
 ets_add_artifact(ID) ->
   case grailbag_artifact:info(ID) of
     {ok, {ID, Type, _Size, _Hash, _CTime, _MTime, _Tags, _Tokens} = Info} ->
-      % TODO: filter unique tags
       ets:insert(?ARTIFACT_TABLE, make_record(Info)),
       ets:insert(?TYPE_TABLE, {Type, ID});
     undefined ->
@@ -296,19 +317,23 @@ terminate(_Arg, _State = #state{tokens = Handle}) ->
 
 handle_call({store, {ID, Type, _Size, _Hash, _CTime, _MTime, Tags, []} = Info} = _Request,
             _From, State) ->
-  % TODO: move inserting record under successful verification
   Changes = grailbag_schema:changes(Type, Tags, []),
   case grailbag_schema:verify(Changes) of
-    ok -> ok;
-    {error, Errors} -> lists:foreach(fun(E) -> log_error(ID, E) end, Errors)
-  end,
-  case ets:insert_new(?ARTIFACT_TABLE, make_record(Info)) of
-    true ->
-      grailbag_schema:store(Changes),
-      ets:insert(?TYPE_TABLE, {Type, ID}),
-      {reply, ok, State};
-    false ->
-      {reply, {error, duplicate_id}, State}
+    ok ->
+      case ets:insert_new(?ARTIFACT_TABLE, make_record(Info)) of
+        true ->
+          grailbag_schema:store(Changes),
+          ets:insert(?TYPE_TABLE, {Type, ID}),
+          {reply, ok, State};
+        false ->
+          {reply, {error, duplicate_id}, State}
+      end;
+    {error, [{unknown_type, _}]} ->
+      {reply, {error, unknown_type}, State};
+    {error, Errors} ->
+      Duplicates = lists:usort([T || {duplicate, T, _V} <- Errors]),
+      Missing = lists:usort([T || {missing, T} <- Errors]),
+      {reply, {error, {schema, Duplicates, Missing}}, State}
   end;
 
 handle_call({delete, ID} = _Request, _From, State) ->
@@ -344,30 +369,34 @@ handle_call({update_tags, ID, SetTags, UnsetTags} = _Request, _From,
       % NOTE: `OldTags' is sorted by the tag name (see `make_record()'
       % function)
       NewTags = merge_tags(OldTags, SetTags, sets:from_list(UnsetTags)),
-      % TODO: move updating record under successful verification
       Changes = grailbag_schema:changes(Type, NewTags, OldTags),
       case grailbag_schema:verify(Changes) of
-        ok -> ok;
-        {error, Errors} -> lists:foreach(fun(E) -> log_error(ID, E) end, Errors)
-      end,
-      case grailbag_artifact:update(ID, NewTags) of
-        {ok, MTime} ->
-          NewRecord = Record#artifact{
-            mtime = MTime,
-            tags = NewTags
-          },
-          ets:insert(?ARTIFACT_TABLE, NewRecord),
-          grailbag_schema:store(Changes),
-          {reply, ok, State};
-        {error, Reason} ->
-          EventID = grailbag_uuid:uuid(),
-          grailbag_log:warn("can't update tags of an artifact in storage", [
-            {operation, update_tags},
-            {error, {term, Reason}},
-            {artifact, ID},
-            {event_id, {uuid, EventID}}
-          ]),
-          {reply, {error, {storage, EventID}}, State}
+        ok ->
+          case grailbag_artifact:update(ID, NewTags) of
+            {ok, MTime} ->
+              NewRecord = Record#artifact{
+                mtime = MTime,
+                tags = NewTags
+              },
+              ets:insert(?ARTIFACT_TABLE, NewRecord),
+              grailbag_schema:store(Changes),
+              {reply, ok, State};
+            {error, Reason} ->
+              EventID = grailbag_uuid:uuid(),
+              grailbag_log:warn("can't update tags of an artifact in storage", [
+                {operation, update_tags},
+                {error, {term, Reason}},
+                {artifact, ID},
+                {event_id, {uuid, EventID}}
+              ]),
+              {reply, {error, {storage, EventID}}, State}
+          end;
+        {error, [{unknown_type, _}]} ->
+          {reply, {error, unknown_type}, State};
+        {error, Errors} ->
+          Duplicates = lists:usort([T || {duplicate, T, _V} <- Errors]),
+          Missing = lists:usort([T || {missing, T} <- Errors]),
+          {reply, {error, {schema, Duplicates, Missing}}, State}
       end;
     [] ->
       {reply, {error, bad_id}, State}
@@ -378,23 +407,29 @@ handle_call({update_tokens, ID, SetTokens, UnsetTokens} = _Request, _From,
   case ets:lookup(?ARTIFACT_TABLE, ID) of
     [#artifact{type = Type, tokens = OldTokens}] ->
       % XXX: allow unsetting any token, but setting only a known one
-      % TODO: move updating record under successful verification
       case grailbag_schema:verify_tokens(Type, SetTokens) of
-        ok -> ok;
-        {error, Errors} -> lists:foreach(fun(E) -> log_error(ID, E) end, Errors)
-      end,
-      OldSet = sets:from_list(OldTokens),
-      % only the tokens that will actually be deleted from this artifact
-      DelSet = sets:intersection(OldSet, sets:from_list(UnsetTokens)),
-      ets:update_element(?ARTIFACT_TABLE, ID, {#artifact.tokens,
-        lists:usort(SetTokens ++ sets:to_list(sets:subtract(OldSet, DelSet)))
-      }),
-      case move_tokens(ID, Type, Handle, SetTokens, sets:to_list(DelSet)) of
         ok ->
-          {reply, ok, State};
-        {error, {storage, _EventID} = Reason} ->
-          % the specific errors were already logged
-          {reply, {error, Reason}, State}
+          OldSet = sets:from_list(OldTokens),
+          % only the tokens that will actually be deleted from this artifact
+          DelSet = sets:intersection(OldSet, sets:from_list(UnsetTokens)),
+          ets:update_element(
+            ?ARTIFACT_TABLE, ID,
+            {#artifact.tokens,
+              lists:usort(SetTokens ++
+                          sets:to_list(sets:subtract(OldSet, DelSet)))}
+          ),
+          case move_tokens(ID, Type, Handle, SetTokens, sets:to_list(DelSet)) of
+            ok ->
+              {reply, ok, State};
+            {error, {storage, _EventID} = Reason} ->
+              % the specific errors were already logged
+              {reply, {error, Reason}, State}
+          end;
+        {error, [{unknown_type, _}]} ->
+          {reply, {error, unknown_type}, State};
+        {error, Errors} ->
+          Unknown = lists:usort([T || {unknown_token, T} <- Errors]),
+          {reply, {error, {schema, Unknown}}, State}
       end;
     [] ->
       {reply, {error, bad_id}, State}
