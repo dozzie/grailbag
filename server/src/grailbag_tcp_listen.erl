@@ -9,10 +9,10 @@
 -behaviour(gen_server).
 
 %% supervision tree API
--export([start/2, start_link/2]).
+-export([start/3, start_link/3]).
 
 %% config reloading
--export([rebind/1, shutdown/1]).
+-export([rebind/2, shutdown/1]).
 
 %% gen_server callbacks
 -export([init/1, terminate/2]).
@@ -31,7 +31,8 @@
   socket :: gen_tcp:socket() | undefined,
   address :: address(),
   bind_address :: any | inet:ip_address(),
-  port :: inet:port_number()
+  port :: inet:port_number(),
+  ssl_options :: [proplists:property()]
 }).
 
 %%% }}}
@@ -42,14 +43,14 @@
 %% @private
 %% @doc Start acceptor process.
 
-start(Addr, Port) ->
-  gen_server:start(?MODULE, [Addr, Port], []).
+start(Addr, Port, SSLOpts) ->
+  gen_server:start(?MODULE, [Addr, Port, SSLOpts], []).
 
 %% @private
 %% @doc Start acceptor process.
 
-start_link(Addr, Port) ->
-  gen_server:start_link(?MODULE, [Addr, Port], []).
+start_link(Addr, Port, SSLOpts) ->
+  gen_server:start_link(?MODULE, [Addr, Port, SSLOpts], []).
 
 %%%---------------------------------------------------------------------------
 %%% config reloading
@@ -59,11 +60,11 @@ start_link(Addr, Port) ->
 %%
 %%   It's mainly useful when DNS entry for the address has changed.
 
--spec rebind(pid()) ->
+-spec rebind(pid(), [proplists:property()]) ->
   ok | {error, term()}.
 
-rebind(Pid) ->
-  gen_server:call(Pid, rebind, infinity).
+rebind(Pid, SSLOpts) ->
+  gen_server:call(Pid, {rebind, SSLOpts}, infinity).
 
 %% @doc Shutdown the listener.
 
@@ -83,7 +84,7 @@ shutdown(Pid) ->
 %% @private
 %% @doc Initialize {@link gen_server} state.
 
-init([Addr, Port] = _Args) ->
+init([Addr, Port, SSLOpts] = _Args) ->
   grailbag_log:set_context(connection, [
     {address, format_address(Addr, Port)}
   ]),
@@ -98,7 +99,8 @@ init([Addr, Port] = _Args) ->
             socket = Socket,
             address = Addr,
             bind_address = BindAddr,
-            port = Port
+            port = Port,
+            ssl_options = SSLOpts
           },
           {ok, State, 0};
         {error, Reason} ->
@@ -131,16 +133,18 @@ terminate(_Arg, _State = #state{socket = Socket}) ->
 %% @private
 %% @doc Handle {@link gen_server:call/2}.
 
-handle_call(rebind = _Request, _From, State) ->
+handle_call({rebind, SSLOpts} = _Request, _From, State) ->
   case rebind_state(State) of
     {ok, State} ->
       % stay silent
-      {reply, ok, State, 0};
+      NewState = State#state{ssl_options = SSLOpts},
+      {reply, ok, NewState, 0};
     {ok, NewState = #state{bind_address = NewBindAddr}} ->
       grailbag_log:info("rebound to a new address", [
         {bind_address, format_address(NewBindAddr)}
       ]),
-      {reply, ok, NewState, 0};
+      NewState1 = NewState#state{ssl_options = SSLOpts},
+      {reply, ok, NewState1, 0};
     {error, Reason, NewState} ->
       case Reason of
         {resolve, E} ->
@@ -155,7 +159,8 @@ handle_call(rebind = _Request, _From, State) ->
             {bind_address, format_address(NewState#state.bind_address)}
           ])
       end,
-      {reply, {error, Reason}, NewState, ?REBIND_LOOP_INTERVAL}
+      NewState1 = NewState#state{ssl_options = SSLOpts},
+      {reply, {error, Reason}, NewState1, ?REBIND_LOOP_INTERVAL}
   end;
 
 handle_call(shutdown = _Request, _From, State) ->
@@ -188,10 +193,11 @@ handle_info(timeout = _Message, State = #state{socket = undefined}) ->
       {noreply, NewState, ?REBIND_LOOP_INTERVAL}
   end;
 
-handle_info(timeout = _Message, State = #state{socket = Socket}) ->
+handle_info(timeout = _Message,
+            State = #state{socket = Socket, ssl_options = SSLOpts}) ->
   case gen_tcp:accept(Socket, ?ACCEPT_LOOP_INTERVAL) of
     {ok, Client} ->
-      grailbag_tcp_conn:take_over(Client),
+      grailbag_tcp_conn:take_over(Client, SSLOpts),
       {noreply, State, 0};
     {error, timeout} ->
       % OK, no incoming connection

@@ -40,39 +40,65 @@ start_link() ->
 
 reload() ->
   {ok, NewAddrs} = application:get_env(grailbag, listen),
-  NewChildren = lists:sort([child_name(A, P) || {A, P} <- NewAddrs]),
-  OldChildren = lists:sort([
-    {Name, Pid} ||
-    {Name, Pid, worker, _} <- supervisor:which_children(?MODULE)
-  ]),
-  Errors = [R || R <- converge(NewChildren, OldChildren), R /= ok],
-  case Errors of
+  Expected = lists:foldl(
+    fun({Addr, Port, SSLOpts}, Acc) ->
+      dict:store(child_name(Addr, Port), SSLOpts, Acc)
+    end,
+    dict:new(),
+    NewAddrs
+  ),
+  Current = lists:foldl(
+    fun({Name, Pid, worker, _}, Acc) -> dict:store(Name, Pid, Acc) end,
+    dict:new(),
+    supervisor:which_children(?MODULE)
+  ),
+  RebindCandidates = dict:fold(
+    fun(Name, Pid, Rebind) ->
+      case dict:find(Name, Expected) of
+        {ok, SSLOpts} ->
+          [{Name, Pid, SSLOpts} | Rebind];
+        error ->
+          ok = stop_child(Name, Pid),
+          Rebind
+      end
+    end,
+    [],
+    Current
+  ),
+  StartErrors = dict:fold(
+    fun(Name, SSLOpts, Errors) ->
+      case dict:is_key(Name, Current) of
+        true ->
+          Errors;
+        false ->
+          case start_child(Name, SSLOpts) of
+            ok -> Errors;
+            Err -> [Err | Errors]
+          end
+      end
+    end,
+    [],
+    Expected
+  ),
+  RebindErrors = lists:foldl(
+    fun({Name, Pid, SSLOpts}, Errors) ->
+      case reload_child(Name, Pid, SSLOpts) of
+        ok -> Errors;
+        Err -> [Err | Errors]
+      end
+    end,
+    [],
+    RebindCandidates
+  ),
+  case StartErrors ++ RebindErrors of
     [] -> ok;
-    _ -> {error, Errors}
+    Errors -> {error, Errors}
   end.
-
-%% @doc Reload workhorse for {@link reload/0}.
-
-converge([] = _New, [] = _Old) ->
-  [];
-converge([NewName | NewRest] = _New, [] = Old) ->
-  [start_child(NewName) | converge(NewRest, Old)];
-converge([] = New, [{OldName, Pid} | OldRest] = _Old) ->
-  [stop_child(OldName, Pid) | converge(New, OldRest)];
-converge([NewName | NewRest] = _New, [{OldName, Pid} | OldRest] = _Old)
-when NewName == OldName ->
-  [reload_child(OldName, Pid) | converge(NewRest, OldRest)];
-converge([NewName | NewRest] = _New, [{OldName, _Pid} | _OldRest] = Old)
-when NewName < OldName ->
-  [start_child(NewName) | converge(NewRest, Old)];
-converge([NewName | _NewRest] = New, [{OldName, Pid} | OldRest] = _Old)
-when OldName < NewName ->
-  [stop_child(OldName, Pid) | converge(New, OldRest)].
 
 %% @doc Start a missing child.
 
-start_child({_, Address, Port} = Name) ->
-  case supervisor:start_child(?MODULE, listen_child(Address, Port)) of
+start_child({_, Address, Port} = Name, SSLOpts) ->
+  case supervisor:start_child(?MODULE, listen_child(Address, Port, SSLOpts)) of
     {ok, _Pid} -> ok;
     {error, Reason} -> {start, Name, Reason}
   end.
@@ -86,8 +112,8 @@ stop_child(Name, Pid) ->
 
 %% @doc Instruct the child to re-bind its listening socket.
 
-reload_child(Name, Pid) ->
-  case grailbag_tcp_listen:rebind(Pid) of
+reload_child(Name, Pid, SSLOpts) ->
+  case grailbag_tcp_listen:rebind(Pid, SSLOpts) of
     ok -> ok;
     {error, Reason} -> {reload, Name, Reason}
   end.
@@ -105,15 +131,15 @@ init([] = _Args) ->
   Children = [
     {grailbag_tcp_conn_sup, {grailbag_tcp_conn_sup, start_link, []},
       permanent, 1000, supervisor, [grailbag_tcp_conn_sup]} |
-    [listen_child(Addr, Port) || {Addr, Port} <- Addrs]
+    [listen_child(Addr, Port, SSLOpts) || {Addr, Port, SSLOpts} <- Addrs]
   ],
   {ok, {Strategy, Children}}.
 
 %%%---------------------------------------------------------------------------
 
-listen_child(Address, Port) ->
+listen_child(Address, Port, SSLOpts) ->
   {child_name(Address, Port),
-    {grailbag_tcp_listen, start_link, [Address, Port]},
+    {grailbag_tcp_listen, start_link, [Address, Port, SSLOpts]},
     transient, 1000, worker, [grailbag_tcp_listen]}.
 
 child_name(Address, Port) ->

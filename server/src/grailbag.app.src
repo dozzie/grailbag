@@ -2,12 +2,15 @@
   {description, "artifact repository"},
   {vsn, "0.0.0"},
   {registered, []},
-  {applications, [kernel, stdlib, crypto]},
+  {applications, [kernel, stdlib, crypto, ssl]},
   {modules, []},
   {mod, {grailbag_app, []}},
   {env, [
+    {log_handlers, []}            % list of `{Module, Args}'
     %{data_dir, "..."}            % `file:filename()'
-    {log_handlers, []},           % list of `{Module, Args}'
-    {listen, [{localhost, 3255}]} % list of `{Address, Port}'
+    %{listen, [
+    %  % list of `{Address, Port, SSLOpts}', including certificate and key files
+    %  {localhost, 3255, [{keyfile, "..."}, {certfile, "..."}, ...]}
+    %]}
   ]}
 ]}.

@@ -9,10 +9,10 @@
 -behaviour(gen_server).
 
 %% public interface
--export([take_over/1]).
+-export([take_over/2]).
 
 %% supervision tree API
--export([start/1, start_link/1]).
+-export([start/0, start_link/0]).
 
 %% gen_server callbacks
 -export([init/1, terminate/2]).
@@ -25,7 +25,7 @@
 -define(READ_CHUNK_SIZE, 16384). % 16kB
 
 -record(state, {
-  socket :: gen_tcp:socket(),
+  socket :: ssl:sslsocket() | undefined,
   read_left :: undefined | grailbag:file_size(),
   upload_hash :: undefined | grailbag:body_hash(),
   handle :: undefined
@@ -45,14 +45,14 @@
 %%   In case of spawning error, the socket is closed. In any case, caller
 %%   shouldn't bother with the socket anymore.
 
--spec take_over(gen_tcp:socket()) ->
+-spec take_over(gen_tcp:socket(), [proplists:property()]) ->
   {ok, pid()} | {error, term()}.
 
-take_over(Socket) ->
-  case grailbag_tcp_conn_sup:spawn_worker(Socket) of
+take_over(Socket, SSLOpts) when is_list(SSLOpts) ->
+  case grailbag_tcp_conn_sup:spawn_worker() of
     {ok, Pid} ->
       ok = gen_tcp:controlling_process(Socket, Pid),
-      inet:setopts(Socket, [binary, {packet, 4}, {active, once}]),
+      gen_server:cast(Pid, {start, Socket, SSLOpts}),
       {ok, Pid};
     {error, Reason} ->
       gen_tcp:close(Socket),
@@ -66,14 +66,14 @@ take_over(Socket) ->
 %% @private
 %% @doc Start worker process.
 
-start(Socket) ->
-  gen_server:start(?MODULE, [Socket], []).
+start() ->
+  gen_server:start(?MODULE, [], []).
 
 %% @private
 %% @doc Start worker process.
 
-start_link(Socket) ->
-  gen_server:start_link(?MODULE, [Socket], []).
+start_link() ->
+  gen_server:start_link(?MODULE, [], []).
 
 %%%---------------------------------------------------------------------------
 %%% gen_server callbacks
@@ -85,20 +85,14 @@ start_link(Socket) ->
 %% @private
 %% @doc Initialize event handler.
 
-init([Socket] = _Args) ->
-  {ok, {PeerAddr, PeerPort}} = inet:peername(Socket),
-  {ok, {LocalAddr, LocalPort}} = inet:sockname(Socket),
-  grailbag_log:set_context(connection, [
-    {client, {str, format_address(PeerAddr, PeerPort)}},
-    {local_address, {str, format_address(LocalAddr, LocalPort)}}
-  ]),
+init([] = _Args) ->
   State = #state{
-    socket = Socket,
+    socket = undefined,
     read_left = undefined,
     upload_hash = undefined,
     handle = undefined
   },
-  {ok, State}.
+  {ok, State, 5000}.
 
 %% @private
 %% @doc Clean up after event handler.
@@ -113,7 +107,10 @@ terminate(_Arg, _State = #state{socket = Socket, handle = Handle}) ->
     undefined ->
       ok
   end,
-  gen_tcp:close(Socket),
+  if
+    Socket /= undefined -> ssl:close(Socket);
+    Socket == undefined -> ok
+  end,
   ok.
 
 %% }}}
@@ -130,12 +127,40 @@ handle_call(_Request, _From, State) ->
 %% @private
 %% @doc Handle {@link gen_server:cast/2}.
 
+handle_cast({start, Socket, SSLOpts} = _Request,
+            State = #state{socket = undefined}) ->
+  {ok, {PeerAddr, PeerPort}} = inet:peername(Socket),
+  {ok, {LocalAddr, LocalPort}} = inet:sockname(Socket),
+  grailbag_log:set_context(connection, [
+    {client, {str, format_address(PeerAddr, PeerPort)}},
+    {local_address, {str, format_address(LocalAddr, LocalPort)}}
+  ]),
+  case ssl:ssl_accept(Socket, SSLOpts) of
+    {ok, SSLConn} ->
+      ssl:setopts(SSLConn, [binary, {packet, 4}, {active, once}]),
+      NewState = State#state{socket = SSLConn},
+      {noreply, NewState};
+    {error, closed} ->
+      % most probably the client rejected our certificate
+      gen_tcp:close(Socket),
+      {stop, normal, State};
+    {error, Reason} ->
+      % TODO: log the SSL error
+      grailbag_log:info("SSL negotiation error", [{error, {term, Reason}}]),
+      gen_tcp:close(Socket),
+      {stop, normal, State}
+  end;
+
 %% unknown casts
 handle_cast(_Request, State) ->
   {noreply, State, 0}.
 
 %% @private
 %% @doc Handle incoming messages.
+
+handle_info(timeout = _Message, State = #state{socket = undefined}) ->
+  % no signal to start was sent for a long time
+  {stop, normal, State};
 
 handle_info(timeout = _Message, State = #state{handle = undefined}) ->
   % break out of timeout loop
@@ -152,7 +177,7 @@ handle_info(timeout = _Message,
   % artifact read and sent in the whole; go back to reading 4-byte
   % size-prefixed requests
   grailbag_artifact:close(Handle),
-  inet:setopts(Socket, [{active, once}, {packet, 4}]),
+  ssl:setopts(Socket, [{active, once}, {packet, 4}]),
   NewState = State#state{
     read_left = undefined,
     handle = undefined
@@ -165,7 +190,7 @@ handle_info(timeout = _Message,
   % timeout->read->send->timeout loop
   case grailbag_artifact:read(Handle, min(ReadLeft, 16 * 1024)) of
     {ok, Data} ->
-      case gen_tcp:send(Socket, Data) of
+      case ssl:send(Socket, Data) of
         ok ->
           NewState = State#state{read_left = ReadLeft - size(Data)},
           {noreply, NewState, 0};
@@ -192,7 +217,7 @@ handle_info(timeout = _Message,
       {stop, normal, State}
   end;
 
-handle_info({tcp, Socket, Data} = _Message,
+handle_info({ssl, Socket, Data} = _Message,
             State = #state{socket = Socket, upload_hash = LocalHash,
                            handle = {upload, ID, Handle}}) ->
   if
@@ -203,7 +228,7 @@ handle_info({tcp, Socket, Data} = _Message,
       % another body chunk
       case grailbag_artifact:write(Handle, Data) of
         ok ->
-          inet:setopts(Socket, [{active, once}]),
+          ssl:setopts(Socket, [{active, once}]),
           {noreply, State};
         {error, Reason} ->
           grailbag_log:warn("artifact write error", [
@@ -220,7 +245,7 @@ handle_info({tcp, Socket, Data} = _Message,
       % in the storage (though data corruption during transfer is a rare
       % event, so it shouldn't be a major problem)
       NewState = State#state{upload_hash = Hash},
-      inet:setopts(Socket, [{active, once}]),
+      ssl:setopts(Socket, [{active, once}]),
       {noreply, NewState};
     is_binary(LocalHash) ->
       % hash sent after end-of-body marker
@@ -248,16 +273,16 @@ handle_info({tcp, Socket, Data} = _Message,
           grailbag_artifact:delete(ID), % let's hope that delete succeeds
           encode_error(body_checksum_mismatch)
       end,
-      case gen_tcp:send(Socket, Reply) of
+      case ssl:send(Socket, Reply) of
         ok ->
-          inet:setopts(Socket, [{active, once}]),
+          ssl:setopts(Socket, [{active, once}]),
           {noreply, NewState};
         {error, _Reason} ->
           {stop, normal, NewState}
       end
   end;
 
-handle_info({tcp, Socket, Data} = _Message,
+handle_info({ssl, Socket, Data} = _Message,
             State = #state{socket = Socket, handle = undefined}) ->
   case decode_request(Data) of
     {store, Type, Tags} -> % long running connection
@@ -292,9 +317,9 @@ handle_info({tcp, Socket, Data} = _Message,
           Reply = encode_error(Reason),
           NewState = State
       end,
-      case gen_tcp:send(Socket, Reply) of
+      case ssl:send(Socket, Reply) of
         ok ->
-          inet:setopts(Socket, [{active, once}]),
+          ssl:setopts(Socket, [{active, once}]),
           {noreply, NewState};
         {error, _} ->
           {stop, normal, NewState}
@@ -311,9 +336,9 @@ handle_info({tcp, Socket, Data} = _Message,
         {error, artifact_has_tokens} -> encode_error(artifact_has_tokens);
         {error, {storage, EventID}} -> encode_error({server_error, EventID})
       end,
-      case gen_tcp:send(Socket, Reply) of
+      case ssl:send(Socket, Reply) of
         ok ->
-          inet:setopts(Socket, [{active, once}]),
+          ssl:setopts(Socket, [{active, once}]),
           {noreply, State};
         {error, _} ->
           {stop, normal, State}
@@ -332,9 +357,9 @@ handle_info({tcp, Socket, Data} = _Message,
         {error, {schema, _, _} = Reason} -> encode_error(Reason);
         {error, {storage, EventID}} -> encode_error({server_error, EventID})
       end,
-      case gen_tcp:send(Socket, Reply) of
+      case ssl:send(Socket, Reply) of
         ok ->
-          inet:setopts(Socket, [{active, once}]),
+          ssl:setopts(Socket, [{active, once}]),
           {noreply, State};
         {error, _} ->
           {stop, normal, State}
@@ -353,9 +378,9 @@ handle_info({tcp, Socket, Data} = _Message,
         {error, {schema, _} = Reason} -> encode_error(Reason);
         {error, {storage, EventID}} -> encode_error({server_error, EventID})
       end,
-      case gen_tcp:send(Socket, Reply) of
+      case ssl:send(Socket, Reply) of
         ok ->
-          inet:setopts(Socket, [{active, once}]),
+          ssl:setopts(Socket, [{active, once}]),
           {noreply, State};
         {error, _} ->
           {stop, normal, State}
@@ -363,9 +388,9 @@ handle_info({tcp, Socket, Data} = _Message,
     list_types ->
       Types = grailbag_reg:list(),
       Reply = encode_types_list(Types),
-      case gen_tcp:send(Socket, Reply) of
+      case ssl:send(Socket, Reply) of
         ok ->
-          inet:setopts(Socket, [{active, once}]),
+          ssl:setopts(Socket, [{active, once}]),
           {noreply, State};
         {error, _} ->
           {stop, normal, State}
@@ -375,9 +400,9 @@ handle_info({tcp, Socket, Data} = _Message,
         true -> encode_list(grailbag_reg:list(Type));
         false -> encode_error(unknown_type)
       end,
-      case gen_tcp:send(Socket, Reply) of
+      case ssl:send(Socket, Reply) of
         ok ->
-          inet:setopts(Socket, [{active, once}]),
+          ssl:setopts(Socket, [{active, once}]),
           {noreply, State};
         {error, _} ->
           {stop, normal, State}
@@ -389,9 +414,9 @@ handle_info({tcp, Socket, Data} = _Message,
         {ok, Info} -> encode_info(Info);
         undefined -> encode_error(unknown_artifact)
       end,
-      case gen_tcp:send(Socket, Reply) of
+      case ssl:send(Socket, Reply) of
         ok ->
-          inet:setopts(Socket, [{active, once}]),
+          ssl:setopts(Socket, [{active, once}]),
           {noreply, State};
         {error, _} ->
           {stop, normal, State}
@@ -404,18 +429,18 @@ handle_info({tcp, Socket, Data} = _Message,
           RawReply = encode_info(Info),
           % we won't be reading for a while, and sending should not add any
           % data (`{packet,4}' adds 4 bytes of packet length)
-          inet:setopts(Socket, [{packet, raw}]),
+          ssl:setopts(Socket, [{packet, raw}]),
           Reply = [<<(iolist_size(RawReply)):32>>, RawReply],
           NewState = State#state{
             read_left = FileSize,
             handle = {download, ID, Handle}
           };
         {error, bad_id} ->
-          inet:setopts(Socket, [{active, once}]),
+          ssl:setopts(Socket, [{active, once}]),
           Reply = encode_error(unknown_artifact),
           NewState = State;
         {error, Reason} ->
-          inet:setopts(Socket, [{active, once}]),
+          ssl:setopts(Socket, [{active, once}]),
           EventID = grailbag_uuid:uuid(),
           grailbag_log:warn("can't open an artifact", [
             {operation, get},
@@ -426,7 +451,7 @@ handle_info({tcp, Socket, Data} = _Message,
           Reply = encode_error({server_error, EventID}),
           NewState = State
       end,
-      case gen_tcp:send(Socket, Reply) of
+      case ssl:send(Socket, Reply) of
         ok ->
           % go into timeout->read->send->timeout loop
           {noreply, NewState, 0};
@@ -438,11 +463,11 @@ handle_info({tcp, Socket, Data} = _Message,
       {stop, normal, State}
   end;
 
-handle_info({tcp_closed, Socket} = _Message,
+handle_info({ssl_closed, Socket} = _Message,
             State = #state{socket = Socket}) ->
   {stop, normal, State};
 
-handle_info({tcp_error, Socket, _Reason} = _Message,
+handle_info({ssl_error, Socket, _Reason} = _Message,
             State = #state{socket = Socket}) ->
   {stop, normal, State};
 

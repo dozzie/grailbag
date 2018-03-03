@@ -2,6 +2,7 @@
 
 import optparse
 import socket
+import ssl
 import errno
 import os
 import platform
@@ -37,6 +38,10 @@ parser.add_option(
     "--server", dest = "server",
     default = "localhost:3255",
     help = "server address", metavar = "ADDR",
+)
+parser.add_option(
+    "--ca-file", dest = "ca_file",
+    help = "CA certificate to verify against", metavar = "PATH",
 )
 
 (options, args) = parser.parse_args()
@@ -483,11 +488,12 @@ class GrailBagServer:
     # }}}
     #------------------------------------------------------
 
-    def __init__(self, host, port = 3255, timeout = 5):
+    def __init__(self, host, port = 3255, ca_file = None, timeout = 5):
         self.host = host
         self.port = port
         self.timeout = timeout
         self.conn = None
+        self.ca_file = ca_file
         self.op_in_progress = False
 
     #------------------------------------------------------
@@ -496,6 +502,11 @@ class GrailBagServer:
     def _connect(self):
         conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         conn.settimeout(self.timeout)
+        if self.ca_file is not None:
+            conn = ssl.wrap_socket(conn, ca_certs = self.ca_file,
+                                   cert_reqs = ssl.CERT_REQUIRED)
+        else:
+            conn = ssl.wrap_socket(conn, cert_reqs = ssl.CERT_NONE)
         try:
             conn.connect((self.host, self.port))
         except Exception as e:
@@ -1070,9 +1081,10 @@ if not OPERATIONS[operation]["nargs"](len(args)):
 
 if ":" in options.server:
     (host, port) = options.server.split(":")
-    server = GrailBagServer(host = host, port = int(port))
+    port = int(port)
+    server = GrailBagServer(host = host, port = port, ca_file = options.ca_file)
 else:
-    server = GrailBagServer(host = options.server)
+    server = GrailBagServer(host = options.server, ca_file = options.ca_file)
 
 try:
     ret = OPERATIONS[operation]["op"](server, *args)

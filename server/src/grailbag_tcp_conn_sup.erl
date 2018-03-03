@@ -10,7 +10,7 @@
 -behaviour(supervisor).
 
 %% public interface
--export([spawn_worker/1]).
+-export([spawn_worker/0]).
 
 %% supervision tree API
 -export([start_link/0]).
@@ -24,11 +24,11 @@
 
 %% @doc Spawn a new worker process.
 
--spec spawn_worker(gen_tcp:socket()) ->
+-spec spawn_worker() ->
   {ok, pid()} | {error, term()}.
 
-spawn_worker(Socket) ->
-  supervisor:start_child(?MODULE, [Socket]).
+spawn_worker() ->
+  supervisor:start_child(?MODULE, []).
 
 %%%---------------------------------------------------------------------------
 %%% supervision tree API
