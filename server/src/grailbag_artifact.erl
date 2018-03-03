@@ -174,7 +174,7 @@ update(ID, Tags) ->
   NewFile = filename:join(Path, ?METADATA_UPDATE_FILE),
   case decode_info_file(OldFile) of
     % TODO: return error on mismatching ID
-    {ok, {_ID, Type, Size, Hash, CTime, _OldMTime, _OldTags, []}} ->
+    {ok, {_ID, Type, Size, Hash, CTime, _OldMTime, _OldTags, [], valid}} ->
       MTime = grailbag:timestamp(),
       case encode_info_file(NewFile, ID, Type, Size, Hash, CTime, MTime, Tags) of
         ok ->
@@ -413,7 +413,7 @@ handle_call(info = _Request, _From,
             State = #state{body = undefined, size = Size, hash = Hash,
                            time = CTime = MTime, metadata = {ID, Type, Tags}})
 when is_binary(Hash) ->
-  ArtifactInfo = {ID, Type, Size, Hash, CTime, MTime, Tags, []},
+  ArtifactInfo = {ID, Type, Size, Hash, CTime, MTime, Tags, [], valid},
   {reply, {ok, ArtifactInfo}, State};
 handle_call(info = _Request, _From, State) ->
   {reply, {error, ebadfd}, State};
@@ -615,7 +615,7 @@ decode_info(Data) ->
       try
         {Tags, <<>>} = decode_tags(NTags, [], TagsData),
         ArtifactInfo = {ID, binary:copy(Type), FileSize, binary:copy(Hash),
-                         CTime, MTime, Tags, []},
+                         CTime, MTime, Tags, [], valid},
         {ok, ArtifactInfo}
       catch
         _:_ ->

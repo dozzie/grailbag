@@ -25,7 +25,8 @@
   {artifact_id(), artifact_type(),
     file_size(), body_hash(),
     ctime(), mtime(),
-    [{tag(), tag_value()}], [token()]}.
+    [{tag(), tag_value()}], [token()],
+    valid | has_errors}.
 
 -type file_size() :: non_neg_integer().
 

@@ -4,6 +4,9 @@
 %%%
 %%%   The registry process is also responsible for modifying disk storage
 %%%   (deleting artifacts, updating their tags and tokens).
+%%%
+%%% @todo Don't validate an artifact against its schema on every access, only
+%%%   on updates (and on schema reloads).
 %%% @end
 %%%---------------------------------------------------------------------------
 
@@ -207,7 +210,11 @@ info(ID) ->
   case ets:lookup(?ARTIFACT_TABLE, ID) of
     [#artifact{type = Type, body_size = Size, body_hash = Hash,
                ctime = CTime, mtime = MTime, tags = Tags, tokens = Tokens}] ->
-      {ok, {ID, Type, Size, Hash, CTime, MTime, Tags, Tokens}};
+      Valid = case grailbag_schema:verify(Type, Tags) of
+        ok -> valid;
+        {error, _} -> has_errors
+      end,
+      {ok, {ID, Type, Size, Hash, CTime, MTime, Tags, Tokens, Valid}};
     [] ->
       undefined
   end.
@@ -267,7 +274,7 @@ init(_Args) ->
 
 ets_add_artifact(ID) ->
   case grailbag_artifact:info(ID) of
-    {ok, {ID, Type, _Size, _Hash, _CTime, _MTime, _Tags, _Tokens} = Info} ->
+    {ok, {ID, Type, _Size, _Hash, _CTime, _MTime, _Tags, _Tokens, _Valid} = Info} ->
       ets:insert(?ARTIFACT_TABLE, make_record(Info)),
       ets:insert(?TYPE_TABLE, {Type, ID});
     undefined ->
@@ -315,7 +322,7 @@ terminate(_Arg, _State = #state{tokens = Handle}) ->
 %% @private
 %% @doc Handle {@link gen_server:call/2}.
 
-handle_call({store, {ID, Type, _Size, _Hash, _CTime, _MTime, Tags, []} = Info} = _Request,
+handle_call({store, {ID, Type, _Size, _Hash, _CTime, _MTime, Tags, [], valid} = Info} = _Request,
             _From, State) ->
   Changes = grailbag_schema:changes(Type, Tags, []),
   case grailbag_schema:verify(Changes) of
@@ -570,7 +577,7 @@ when OTag > STag ->
 -spec make_record(grailbag:artifact_info()) ->
   #artifact{}.
 
-make_record({ID, Type, Size, Hash, CTime, MTime, Tags, Tokens} = _Info) ->
+make_record({ID, Type, Size, Hash, CTime, MTime, Tags, Tokens, _Valid} = _Info) ->
   #artifact{
     id = ID,
     type = Type,

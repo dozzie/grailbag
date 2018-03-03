@@ -224,7 +224,7 @@ handle_info({tcp, Socket, Data} = _Message,
       {noreply, NewState};
     is_binary(LocalHash) ->
       % hash sent after end-of-body marker
-      {ok, {_, Type, Size, _Hash, CTime, MTime, Tags, []}} =
+      {ok, {_, Type, Size, _Hash, CTime, MTime, Tags, [], valid}} =
         grailbag_artifact:info(Handle),
       grailbag_artifact:close(Handle),
       NewState = State#state{
@@ -400,7 +400,7 @@ handle_info({tcp, Socket, Data} = _Message,
       % TODO: check if the artifact conforms to its schema
       case grailbag_artifact:open(ID) of
         {ok, Handle} ->
-          {ok, {_, _, FileSize, _, _, _, _, _} = Info} = grailbag_reg:info(ID),
+          {ok, {_, _, FileSize, _, _, _, _, _, _} = Info} = grailbag_reg:info(ID),
           RawReply = encode_info(Info),
           % we won't be reading for a while, and sending should not add any
           % data (`{packet,4}' adds 4 bytes of packet length)
@@ -526,7 +526,8 @@ encode_types_list(Types) ->
 -spec encode_artifact_info(grailbag:artifact_info()) ->
   iolist().
 
-encode_artifact_info({ID, Type, FileSize, Hash, CTime, MTime, Tags, Tokens} = _Info) ->
+encode_artifact_info({ID, Type, FileSize, Hash, CTime, MTime, Tags, Tokens, _Valid} = _Info) ->
+  % TODO: encode `Valid' flag
   _Result = [
     grailbag_uuid:parse(binary_to_list(ID)),
     <<(size(Type)):16>>, Type,
