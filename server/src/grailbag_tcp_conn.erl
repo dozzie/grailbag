@@ -590,15 +590,19 @@ encode_error(body_checksum_mismatch) ->
   <<15:4, 2:12, 0:16>>;
 encode_error(artifact_has_tokens) ->
   <<15:4, 3:12, 0:16>>;
-encode_error({schema, _TagDupNames, _TagMissingNames}) ->
-  % TODO: encode the errors
-  NErrors = 0,
-  Errors = <<>>,
+encode_error({schema, TagDupNames, TagMissingNames}) ->
+  NErrors = length(TagDupNames) + length(TagMissingNames),
+  Errors = iolist_to_binary([
+    [[<<1:8, (size(Tag)):16>>, Tag] || Tag <- TagDupNames],
+    [[<<2:8, (size(Tag)):16>>, Tag] || Tag <- TagMissingNames]
+  ]),
   <<15:4, 4:12, NErrors:16, Errors/binary>>;
-encode_error({schema, _UnknownTokenNames}) ->
-  % TODO: encode the errors
-  NErrors = 0,
-  Errors = <<>>,
+encode_error({schema, UnknownTokenNames}) ->
+  NErrors = length(UnknownTokenNames),
+  Errors = iolist_to_binary([
+    [<<3:8, (size(Token)):16>>, Token] ||
+    Token <- UnknownTokenNames
+  ]),
   <<15:4, 4:12, NErrors:16, Errors/binary>>.
 
 %% }}}
