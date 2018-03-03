@@ -167,6 +167,7 @@ class Artifact:
         self.mtime = None
         self.tags = {}
         self.tokens = []
+        self.valid = False # conforming to artifact's schema
 
 # }}}
 #------------------------------------------------------
@@ -688,6 +689,8 @@ class GrailBagServer:
         result = Artifact()
         result.id = str(reply.uuid())
         result.type = reply.str16()
+        flags = reply.int16()
+        result.valid = ((flags & 0x8000) == 0)
         result.size = reply.int64()
         result.digest = reply.str16()
         result.ctime = reply.int64()
@@ -783,14 +786,18 @@ class GrailBagServer:
 # format_artifact_info() {{{
 
 def format_artifact_info(info):
+    if info.valid:
+        valid = "conforming to schema"
+    else:
+        valid = "schema errors"
     return (
-        "ID {id} type={type}\n"
+        "ID {id} type={type} <{valid}>\n"
         "  body: size={size} SHA1={hash}\n"
         "  ctime: [{ctime}] mtime: [{mtime}]\n"
         "  tags: {tags}\n"
         "  tokens: {tokens}"
     ).format(
-        id = info.id, type = info.type,
+        id = info.id, type = info.type, valid = valid,
         size = info.size, hash = info.digest.encode("hex"),
         ctime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(info.ctime)),
         mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(info.mtime)),

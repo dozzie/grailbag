@@ -526,11 +526,15 @@ encode_types_list(Types) ->
 -spec encode_artifact_info(grailbag:artifact_info()) ->
   iolist().
 
-encode_artifact_info({ID, Type, FileSize, Hash, CTime, MTime, Tags, Tokens, _Valid} = _Info) ->
-  % TODO: encode `Valid' flag
+encode_artifact_info({ID, Type, FileSize, Hash, CTime, MTime, Tags, Tokens, Valid} = _Info) ->
+  Flags = case Valid of
+    valid -> <<0:1, 0:15>>;
+    has_errors -> <<1:1, 0:15>>
+  end,
   _Result = [
     grailbag_uuid:parse(binary_to_list(ID)),
     <<(size(Type)):16>>, Type,
+    Flags,
     <<FileSize:64>>,
     <<(size(Hash)):16>>, Hash,
     <<CTime:64, MTime:64>>,
