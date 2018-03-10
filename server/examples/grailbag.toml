@@ -5,33 +5,76 @@
 #-----------------------------------------------------------------------------
 # known artifacts and their schemas
 
-[artifact.kernel]
-unique_tags = ["build_version"]
-mandatory_tags = ["build_version", "upstream_version"]
-#parts = ["vmlinuz", "modules.tar.gz"] # TODO: plans for the future
-tokens = ["testing", "default"]
-#autodelete = { days = 30, count = 20 } # TODO: plans for the future
+[artifacts]
+# TOML file with known artifacts and their schemas; artifacts can also be
+# specified in-line, as subsections of [artifact] (see below)
+#schema = "/etc/grailbag/schema.toml"
 
-[artifact.rootfs]
-unique_tags = ["version"]
-mandatory_tags = ["version", "arch", "os_release"]
+# example of an in-line artifact schema
+#[artifacts.kernel]
+#unique_tags = ["build_version"]
+#mandatory_tags = ["build_version", "arch", "upstream_version"]
+#tokens = ["default", "testing"]
 
 #-----------------------------------------------------------------------------
-# daemon configuration
+# authentication and authorization
+
+# TODO: plan this section more thoroughly
+
+[users]
+auth_script = "/etc/grailbag/bin/users"
+#auth_script = ["/etc/grailbag/bin/users", "arg1", "arg2", ...]
+protocol = "binary"
+#protocol = "json"
+workers = 3
+
+#-----------------------------------------------------------------------------
+# network configuration
 
 [network]
+# list of addresses to listen on ("address:port" or "*:port"); if not
+# specified here and no [network."address:port"] section is defined, defaults
+# to "localhost:3255"
 #listen = ["localhost:3255"]
+# paths to X.509 certificate and private key; must be specified in some way,
+# either here, in file pointed by network.options, or in
+# [network."address:port"] section
+cert = "/etc/grailbag/ssl/grailbag.cert.pem"
+key  = "/etc/grailbag/ssl/grailbag.key.pem"
+# additional options for Erlang SSL sockets; can contain path to a certificate
+# or private key file (network.cert and network.key take the precedence)
+# if not specified or the file doesn't exist, no additional options will be
+# loaded
+#options = "/etc/grailbag/ssl/options"
+
+# listen addresses specified as a section
+#[network."localhost:3255"]
+# settings not specified here will be taken from [network] section
+#cert = "/etc/grailbag/ssl/grailbag.cert.pem"
+#key  = "/etc/grailbag/ssl/grailbag.key.pem"
+#options = "/etc/grailbag/ssl/options"
+
+#-----------------------------------------------------------------------------
+# storage configuration
 
 [storage]
+# directory for artifacts and their tags and tokens
 data_dir = "/var/lib/grailbag"
-#hash = "sha1" # TODO: support for anything else
-#oplog_size = ... # bytes? number of operations?
+
+#-----------------------------------------------------------------------------
+# logging
+
+[logging]
+# list of log handlers for logs from GrailBag
+# prepared handlers: grailbag_syslog_h, grailbag_stdout_h
+handlers = ["grailbag_syslog_h"]
+# file with Erlang system events log (so called `error_logger')
+#erlang_log = "/var/log/grailbag/erlang.log"
 
 #-----------------------------------------------------------------------------
 # Erlang configuration
 
 [erlang]
-
 # name of Erlang node in distributed mode (<node_name>@<hostname>)
 node_name = "grailbag"
 # type of hostnames in distributed mode ("longnames" or "shortnames", as
@@ -42,9 +85,6 @@ cookie_file = "/etc/grailbag/cookie.txt"
 # start distributed Erlang immediately or on command-line request
 # ("grailbagd dist-erl-start")
 distributed_immediate = false
-
-# file with Erlang system events log
-#log_file = "/var/log/grailbag/erlang.log"
 
 #-----------------------------------------------------------------------------
 # vim:ft=dosini

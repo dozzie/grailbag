@@ -1,0 +1,22 @@
+#-----------------------------------------------------------------------------
+# known artifacts and their schemas
+
+[kernel]
+# tags that, if set, must have a different value for every artifact of type
+# "kernel"
+unique_tags = ["build_version"]
+# tags that must be set for artifacts of type "kernel"
+mandatory_tags = ["build_version", "arch", "upstream_version"]
+# tokens that can be set for artifacts of type "kernel"
+tokens = ["default", "testing"]
+
+# TODO: these two are plans for the future
+#parts = ["vmlinuz", "modules.tar.gz"]
+#autodelete = { days = 30, count = 20 }
+
+[rootfs]
+unique_tags = ["version"]
+mandatory_tags = ["version", "arch", "os_release"]
+
+#-----------------------------------------------------------------------------
+# vim:ft=dosini
