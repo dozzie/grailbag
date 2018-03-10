@@ -1,7 +1,14 @@
 {application, grailbag, [
   {description, "artifact repository"},
   {vsn, "0.0.0"},
-  {registered, []},
+  {registered, [
+    grailbag_sup,
+    grailbag_log,
+    grailbag_reg,
+    grailbag_artifact_sup,
+    grailbag_tcp_sup,
+    grailbag_tcp_conn_sup
+  ]},
   {applications, [kernel, stdlib, crypto, ssl]},
   {modules, []},
   {mod, {grailbag_app, []}},
