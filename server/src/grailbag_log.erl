@@ -110,7 +110,7 @@ info(EventType, Message, EventInfo) ->
 
 %% @doc Minor error event.
 %%   Typically the error has its cause in some remote entity (e.g. protocol
-%%   error), but it's harmless for the operation of HarpCaller.
+%%   error), but it's harmless for the operation of the daemon.
 %%
 %%   Function expects {@link set_context/2} to be called first.
 
@@ -123,7 +123,7 @@ warn(Message) ->
 
 %% @doc Minor error event.
 %%   Typically the error has its cause in some remote entity (e.g. protocol
-%%   error), but it's harmless for the operation of HarpCaller.
+%%   error), but it's harmless for the operation of the daemon.
 %%
 %%   Function expects {@link set_context/2} to be called first.
 
@@ -137,7 +137,7 @@ warn(Message, EventInfo) ->
 
 %% @doc Minor error event.
 %%   Typically the error has its cause in some remote entity (e.g. protocol
-%%   error), but it's harmless for the operation of HarpCaller.
+%%   error), but it's harmless for the operation of the daemon.
 
 -spec warn(event_type(), event_message(), event_info()) ->
   ok.

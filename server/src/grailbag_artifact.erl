@@ -7,7 +7,6 @@
 %%%
 %%%   <i>info</i> file structure: artifact type, tags, tokens.
 %%%
-%%% @todo Save artifact's schema.
 %%% @todo Make {@link update/2} more efficient (less decode-update-encode).
 %%% @end
 %%%---------------------------------------------------------------------------
