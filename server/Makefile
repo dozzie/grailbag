@@ -17,6 +17,8 @@ DIAGRAMS_SVG = $(foreach D,$(DIAGRAMS),doc/images/$D.svg)
 PROJECT = grailbag
 APP_VERSION = $(call app-version,ebin/$(PROJECT).app)
 ERL_INSTALL_LIB_DIR = $(ERL_LIB_DIR)/$(PROJECT)-$(APP_VERSION)
+DOCDIR = /usr/share/doc/grailbag
+MANDIR = /usr/share/man
 CONFDIR = /etc/grailbag
 ESCRIPT_ARGS_FILE = $(CONFDIR)/erlang.args
 
@@ -53,15 +55,20 @@ doc/images/%.svg: diagrams/%.diag
 
 #-----------------------------------------------------------------------------
 
-#.PHONY: install install-erlang install-doc
-#
-#install: install-erlang install-doc
-#
-#install-erlang: app
-#	$(call install-wildcard,644,ebin/*,$(DESTDIR)$(ERL_INSTALL_LIB_DIR)/ebin)
-#
-#install-doc: edoc
-#	$(call install-wildcard,644,doc/*.html doc/*.png doc/*.css,$(DESTDIR)$(DOCDIR)/html)
+.PHONY: install install-erlang install-doc
+
+install: install-erlang
+
+install-erlang: app
+	$(call install-wildcard,644,ebin/*,$(DESTDIR)$(ERL_INSTALL_LIB_DIR)/ebin)
+	$(call install-escript,bin/grailbagd,$(DESTDIR)/usr/sbin/grailbagd,-noinput -kernel error_logger silent -args_file $(ESCRIPT_ARGS_FILE))
+	mkdir -p $(DESTDIR)$(CONFDIR)
+	touch $(DESTDIR)$(ESCRIPT_ARGS_FILE)
+	install -m 644 examples/grailbag.toml $(DESTDIR)$(CONFDIR)/grailbag.toml.example
+	install -m 644 examples/schema.toml $(DESTDIR)$(CONFDIR)/schema.toml.example
+
+install-doc: edoc
+	$(call install-wildcard,644,doc/*.html doc/*.png doc/*.css,$(DESTDIR)$(DOCDIR)/erlang-api)
 
 #-----------------------------------------------------------------------------
 # vim:ft=make
