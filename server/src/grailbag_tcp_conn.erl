@@ -132,8 +132,8 @@ handle_cast({start, Socket, SSLOpts} = _Request,
   {ok, {PeerAddr, PeerPort}} = inet:peername(Socket),
   {ok, {LocalAddr, LocalPort}} = inet:sockname(Socket),
   grailbag_log:set_context(connection, [
-    {client, {str, format_address(PeerAddr, PeerPort)}},
-    {local_address, {str, format_address(LocalAddr, LocalPort)}}
+    {client, format_address(PeerAddr, PeerPort)},
+    {local_address, format_address(LocalAddr, LocalPort)}
   ]),
   case ssl:ssl_accept(Socket, SSLOpts) of
     {ok, SSLConn} ->
@@ -774,77 +774,16 @@ decode_names(_N, _Names, _Data) ->
 %% @doc Format IP address and port number for logging.
 
 -spec format_address(inet:ip_address(), inet:port_number()) ->
-  string().
+  binary().
 
-format_address({A,B,C,D} = _Address, Port) ->
-  OctetList = [
-    integer_to_list(A), integer_to_list(B),
-    integer_to_list(C), integer_to_list(D)
-  ],
-  string:join(OctetList, ".") ++ ":" ++ integer_to_list(Port);
-format_address({0, 0, 0, 0, 0, 16#ffff, A, B} = _Address, Port) ->
-  OctetList = [
-    integer_to_list(A div 256), integer_to_list(A rem 256),
-    integer_to_list(B div 256), integer_to_list(B rem 256)
-  ],
-  "[::ffff:" ++ string:join(OctetList, ".") ++ "]:" ++ integer_to_list(Port);
+format_address({_,_,_,_} = Address, Port) ->
+  iolist_to_binary([
+    grailbag:format_address(Address), ":", integer_to_list(Port)
+  ]);
 format_address({_,_,_,_,_,_,_,_} = Address, Port) ->
-  "[" ++ string:to_lower(format_ipv6(Address)) ++ "]:" ++ integer_to_list(Port).
-
-%% @doc Present IPv6 address in its shortened string format.
-%%
-%%   Note that the hex digits are upper case, so {@link string:to_lower/1}
-%%   should be used on the returned value.
-
--spec format_ipv6(Addr :: inet:ip6_address()) ->
-  string().
-
-format_ipv6({0, 0, 0, 0, 0, 0, 0, 0}) -> "::";
-
-format_ipv6({0, 0, 0, 0, 0, 0, 0, A}) -> add_colons(["", "", A]);
-format_ipv6({A, 0, 0, 0, 0, 0, 0, 0}) -> add_colons([A, "", ""]);
-
-format_ipv6({0, 0, 0, 0, 0, 0, A, B}) -> add_colons(["", "", A, B]);
-format_ipv6({A, 0, 0, 0, 0, 0, 0, B}) -> add_colons([A, "", B]);
-format_ipv6({A, B, 0, 0, 0, 0, 0, 0}) -> add_colons([A, B, "", ""]);
-
-format_ipv6({0, 0, 0, 0, 0, A, B, C}) -> add_colons(["", "", A, B, C]);
-format_ipv6({A, 0, 0, 0, 0, 0, B, C}) -> add_colons([A, "", B, C]);
-format_ipv6({A, B, 0, 0, 0, 0, 0, C}) -> add_colons([A, B, "", C]);
-format_ipv6({A, B, C, 0, 0, 0, 0, 0}) -> add_colons([A, B, C, "", ""]);
-
-format_ipv6({0, 0, 0, 0, A, B, C, D}) -> add_colons(["", "", A, B, C, D]);
-format_ipv6({A, 0, 0, 0, 0, B, C, D}) -> add_colons([A, "", B, C, D]);
-format_ipv6({A, B, 0, 0, 0, 0, C, D}) -> add_colons([A, B, "", C, D]);
-format_ipv6({A, B, C, 0, 0, 0, 0, D}) -> add_colons([A, B, C, "", D]);
-format_ipv6({A, B, C, D, 0, 0, 0, 0}) -> add_colons([A, B, C, D, "", ""]);
-
-format_ipv6({0, 0, 0, A, B, C, D, E}) -> add_colons(["", "", A, B, C, D, E]);
-format_ipv6({A, 0, 0, 0, B, C, D, E}) -> add_colons([A, "", B, C, D, E]);
-format_ipv6({A, B, 0, 0, 0, C, D, E}) -> add_colons([A, B, "", C, D, E]);
-format_ipv6({A, B, C, 0, 0, 0, D, E}) -> add_colons([A, B, C, "", D, E]);
-format_ipv6({A, B, C, D, 0, 0, 0, E}) -> add_colons([A, B, C, D, "", E]);
-format_ipv6({A, B, C, D, E, 0, 0, 0}) -> add_colons([A, B, C, D, E, "", ""]);
-
-format_ipv6({0, 0, A, B, C, D, E, F}) -> add_colons(["", "", A, B, C, D, E, F]);
-format_ipv6({A, 0, 0, B, C, D, E, F}) -> add_colons([A, "", B, C, D, E, F]);
-format_ipv6({A, B, 0, 0, C, D, E, F}) -> add_colons([A, B, "", C, D, E, F]);
-format_ipv6({A, B, C, 0, 0, D, E, F}) -> add_colons([A, B, C, "", D, E, F]);
-format_ipv6({A, B, C, D, 0, 0, E, F}) -> add_colons([A, B, C, D, "", E, F]);
-format_ipv6({A, B, C, D, E, 0, 0, F}) -> add_colons([A, B, C, D, E, "", F]);
-format_ipv6({A, B, C, D, E, F, 0, 0}) -> add_colons([A, B, C, D, E, F, "", ""]);
-
-format_ipv6({A, B, C, D, E, F, G, H}) -> add_colons([A, B, C, D, E, F, G, H]).
-
-%% @doc Join a list of fields with colons.
-
--spec add_colons(Fields :: [[] | integer()]) ->
-  string().
-
-add_colons([""]) -> "";
-add_colons([F]) -> integer_to_list(F, 16);
-add_colons(["" | Rest]) -> ":" ++ add_colons(Rest);
-add_colons([F | Rest]) -> integer_to_list(F, 16) ++ ":" ++ add_colons(Rest).
+  iolist_to_binary([
+    "[", grailbag:format_address(Address), "]:", integer_to_list(Port)
+  ]).
 
 %% }}}
 %%----------------------------------------------------------
