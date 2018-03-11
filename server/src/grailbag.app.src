@@ -14,7 +14,14 @@
   {mod, {grailbag_app, []}},
   {env, [
     {log_handlers, []}            % list of `{Module, Args}'
-    %{data_dir, "..."}            % `file:filename()'
+    %{data_dir, "..."},           % `file:filename()'
+    %{schema, [
+    %  {ArtifactType,
+    %    Mandatory :: [grailbag:tag()],
+    %    Unique :: [grailbag:tag()],
+    %    KnownTokens :: [grailbag:token()]},
+    %  ...
+    %]},
     %{listen, [
     %  % list of `{Address, Port, SSLOpts}', including certificate and key files
     %  {localhost, 3255, [{keyfile, "..."}, {certfile, "..."}, ...]}
