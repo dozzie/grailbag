@@ -258,6 +258,19 @@ format_error({config, toml, Reason}) ->
   ["config error: ", toml:format_error(Reason)];
 format_error({config, {missing, Section, Key}}) ->
   ["config error: missing required key ", format_toml_key(Section, Key)];
+format_error({config, {schema, toml, Message, SchemaFile}}) ->
+  ["schema file error: ", SchemaFile, ": ", Message];
+format_error({config, {network, no_cert, {_,_} = AddrPort}}) ->
+  ["no certificate specified for listen address ",
+    format_address(AddrPort)];
+format_error({config, {network, no_key, {_,_} = AddrPort}}) ->
+  ["no private key specified for listen address ",
+    format_address(AddrPort)];
+format_error({config, {network, no_cert_key, {_,_} = AddrPort}}) ->
+  ["neither certificate nor private key specified for listen address ",
+    format_address(AddrPort)];
+format_error({config, {network, consult, Message, OptsFile}}) ->
+  ["SSL options file reading error: ", OptsFile, ": ", Message];
 
 format_error({log_file, Error}) ->
   ["error opening log file: ", indira_disk_h:format_error(Error)];
@@ -302,6 +315,16 @@ format_term(Term) ->
 
 format_toml_key(Section, Key) ->
   [$", [[S, $.] || S <- Section], Key, $"].
+
+%% @doc Format listen address for error message.
+
+-spec format_address({any | inet:hostname(), inet:port_number()}) ->
+  iolist().
+
+format_address({any = _Addr, Port} = _AddrPort) ->
+  ["*:", integer_to_list(Port)];
+format_address({Addr, Port} = _AddrPort) ->
+  [Addr, ":", integer_to_list(Port)].
 
 %% }}}
 %%----------------------------------------------------------
@@ -430,7 +453,10 @@ reload(Path) ->
        ErrorLoggerLog :: file:filename() | undefined,
        Reason :: {config, validate, Where :: term()}
                | {config, toml, toml:toml_error()}
-               | {config, {missing, toml:section(), toml:key()}}.
+               | {config, {missing, toml:section(), toml:key()}}
+               | {config, {schema, toml, string(), file:filename()}}
+               | {config, {network, consult, string(), file:filename()}}
+               | {config, {network, Error :: atom(), AddrPort :: tuple()}}.
 
 config_load(Path) ->
   case toml:read_file(Path, {fun config_validate/4, []}) of
@@ -439,6 +465,12 @@ config_load(Path) ->
         {ok, AppEnv, IndiraOpts, ErrorLoggerLog} ->
           {ok, AppEnv, IndiraOpts, ErrorLoggerLog};
         {error, {missing, _Section, _Key} = Reason} ->
+          {error, {config, Reason}};
+        {error, {schema, toml, _Error, _File} = Reason} ->
+          {error, {config, Reason}};
+        {error, {network, consult, _Error, _File} = Reason} ->
+          {error, {config, Reason}};
+        {error, {network, _Error, _AddrPort} = Reason} ->
           {error, {config, Reason}}
       end;
     {error, {validate, Where, _Reason}} ->
@@ -460,7 +492,10 @@ config_load(Path) ->
   when AppEnv :: [{atom(), term()}],
        IndiraOpts :: [indira:daemon_option()],
        ErrorLoggerLog :: file:filename() | undefined,
-       Reason :: {missing, toml:section(), toml:key()}.
+       Reason :: {missing, toml:section(), toml:key()}
+               | {schema, toml, string(), file:filename()}
+               | {network, consult, string(), file:filename()}
+               | {network, Error :: atom(), AddrPort :: tuple()}.
 
 config_build(TOMLConfig) ->
   try build_app_env(TOMLConfig) of
@@ -472,6 +507,12 @@ config_build(TOMLConfig) ->
       {error, Reason}
   catch
     throw:{error, {missing, _Section, _Key} = Reason} ->
+      {error, Reason};
+    throw:{error, {schema, toml, _Message, _File} = Reason} ->
+      {error, Reason};
+    throw:{error, {network, consult, _Message, _File} = Reason} ->
+      {error, Reason};
+    throw:{error, {network, _Error, _AddrPort} = Reason} ->
       {error, Reason}
   end.
 
@@ -496,16 +537,30 @@ build_indira_opts(TOMLConfig) ->
 
 build_app_env(TOMLConfig) ->
   {ok, DefaultEnv} = indira:default_env(grailbag),
-  AppEnv = make_proplist(TOMLConfig, DefaultEnv, [
+  InitEnv = [
+    {listen, build_listen_addrs(TOMLConfig)},
+    {schema, build_schema(TOMLConfig)} |
+    DefaultEnv
+  ],
+  AppEnv = make_proplist(TOMLConfig, InitEnv, [
+    % XXX: [artifacts] section is handled separately by `build_schema()'
+    % XXX: [network] section is handled separately by `build_listen_addrs()'
+    %{["users"], "auth_script",  auth_script},
+    %{["users"], "protocol",     auth_protocol},
+    %{["users"], "workers",      auth_workers},
+    {["storage"], "data_dir",   data_dir},
     {["logging"], "handlers",   log_handlers},
     {["logging"], "erlang_log", error_logger_file}
   ]),
   % check required options that have no good default values (mainly, paths to
   % things)
-  case app_env_defined([], AppEnv) of
-    ok -> {ok, AppEnv}
+  Mandatory = [data_dir], % plus: `[auth_script, auth_protocol]'
+  case app_env_defined(Mandatory, AppEnv) of
+    ok -> {ok, AppEnv};
     % compare `make_proplist()' call above
-    %{missing, foo} -> {error, {missing, [Section], "Key"}}
+    %{missing, auth_script}   -> {error, {missing, ["users"], "auth_script"}};
+    %{missing, auth_protocol} -> {error, {missing, ["users"], "protocol"}};
+    {missing, data_dir}      -> {error, {missing, ["storage"], "data_dir"}}
   end.
 
 %% @doc Check if all required variables are present in an application
@@ -538,6 +593,239 @@ make_proplist(TOMLConfig, Init, Keys) ->
     end,
     Init, Keys
   ).
+
+%% }}}
+%%----------------------------------------------------------
+%% build_listen_addrs() {{{
+
+%% @doc Build a list of options for `listen' application environment
+%%   parameter.
+
+-spec build_listen_addrs(toml:config()) ->
+  [Listen]
+  when Listen :: {Addr :: any | inet:hostname(), Port :: inet:port_number(),
+                   Opts :: [proplists:property()]}.
+
+build_listen_addrs(TOMLConfig) ->
+  {_, ListenList}  = toml:get_value(["network"], "listen",  TOMLConfig, {data, []}),
+  {_, DefCertFile} = toml:get_value(["network"], "cert",    TOMLConfig, {data, none}),
+  {_, DefKeyFile}  = toml:get_value(["network"], "key",     TOMLConfig, {data, none}),
+  {_, DefOptsFile} = toml:get_value(["network"], "options", TOMLConfig, {data, none}),
+  % options to use if nothing better was found (cert/key files set in TOML
+  % have precedence over the options file)
+  DefOpts = replace_props(DefCertFile, DefKeyFile, consult_file(DefOptsFile)),
+  % any address without its section will get the default options
+  ListenInit = lists:foldl(
+    fun({Addr, Port}, Acc) -> dict:store({Addr, Port}, DefOpts, Acc) end,
+    dict:new(),
+    ListenList
+  ),
+  Listen = lists:foldr(
+    fun(AddrPort, Acc) ->
+      {Addr, Port} = parse_listen(AddrPort),
+      {_, CertFile} = toml:get_value(["network", AddrPort], "cert", TOMLConfig, {data, none}),
+      {_, KeyFile}  = toml:get_value(["network", AddrPort], "key",  TOMLConfig, {data, none}),
+      case toml:get_value(["network", AddrPort], "options", TOMLConfig) of
+        {string, OptsFile} ->
+          Opts = replace_props(CertFile, KeyFile, consult_file(OptsFile));
+        none ->
+          Opts = replace_props(CertFile, KeyFile, DefOpts)
+      end,
+      dict:store({Addr, Port}, Opts, Acc)
+    end,
+    ListenInit,
+    toml:sections(["network"], TOMLConfig)
+  ),
+  case dict:size(Listen) of
+    0 ->
+      [listen_entry("localhost", 3255, DefOpts, DefCertFile, DefKeyFile)];
+    _ ->
+      % XXX: `listen_entry()' may still need to add a cert/key file if only an
+      % options file was specified in [network."addr:port"] section and it
+      % didn't contain cert or key (if they were, they have the precedence
+      % over the defaults from [network] section)
+      lists:sort(dict:fold(
+        fun({Addr, Port}, Opts, Acc) ->
+          [listen_entry(Addr, Port, Opts, DefCertFile, DefKeyFile) | Acc]
+        end,
+        [],
+        Listen
+      ))
+  end.
+
+%% @doc Create an entry suitable for `listen' environment parameter.
+%%
+%%   If the entry doesn't have a certificate and/or private key, they're added
+%%   from `DefCertFile' and `DefKeyFile' or an error value is thrown.
+
+-spec listen_entry(any | inet:hostname(), inet:port_number(),
+                   [proplists:property()], file:filename(), file:filename()) ->
+  {Addr :: any | inet:hostname(), Port :: inet:port_number(),
+    Opts :: [proplists:property()]}.
+
+listen_entry(Addr, Port, Opts, DefCertFile, DefKeyFile) ->
+  case has_cert_key(Opts) of
+    {cert, key} ->
+      {Addr, Port, Opts};
+
+    {no_cert, key} when DefCertFile /= none ->
+      {Addr, Port, [{certfile, DefCertFile} | Opts]};
+    {no_cert, key} when DefCertFile == none ->
+      erlang:throw({error, {network, no_cert, {Addr, Port} }});
+
+    {cert, no_key} when DefKeyFile /= none->
+      {Addr, Port, [{keyfile, DefKeyFile} | Opts]};
+    {cert, no_key} when DefKeyFile == none ->
+      erlang:throw({error, {network, no_key, {Addr, Port} }});
+
+    {no_cert, no_key} when DefCertFile /= none, DefKeyFile /= none ->
+      {Addr, Port, [{certfile, DefCertFile}, {keyfile, DefKeyFile} | Opts]};
+    {no_cert, no_key} when DefCertFile == none, DefKeyFile /= none ->
+      erlang:throw({error, {network, no_cert, {Addr, Port} }});
+    {no_cert, no_key} when DefCertFile /= none, DefKeyFile == none ->
+      erlang:throw({error, {network, no_key, {Addr, Port} }});
+    {no_cert, no_key} when DefCertFile == none, DefKeyFile == none ->
+      erlang:throw({error, {network, no_cert_key, {Addr, Port} }})
+  end.
+
+%% @doc Load SSL socket options file.
+
+-spec consult_file(file:filename()) ->
+  [proplists:property()].
+
+consult_file(OptsFile) ->
+  case file:consult(OptsFile) of
+    {ok, Opts} -> Opts;
+    {error, enoent} -> [];
+    {error, Reason} ->
+      Message = file:format_error(Reason),
+      erlang:throw({error, {network, consult, Message, OptsFile}})
+  end.
+
+%% @doc Replace certificate and/or private key entries in a list of SSL socket
+%%   options.
+
+-spec replace_props(file:filename() | none, file:filename() | none,
+                    [proplists:property()]) ->
+  [proplists:property()].
+
+replace_props(none = _CertFile, none = _KeyFile, Options) ->
+  Options;
+replace_props(none = _CertFile, KeyFile, Options) ->
+  Filtered = lists:filter(
+    fun
+      ({key,     _}) -> false;
+      ({keyfile, _}) -> false;
+      (_) -> true
+    end,
+    Options
+  ),
+  [{keyfile, KeyFile} | Filtered];
+replace_props(CertFile, none = _KeyFile, Options) ->
+  Filtered = lists:filter(
+    fun
+      ({cert,     _}) -> false;
+      ({certfile, _}) -> false;
+      (_) -> true
+    end,
+    Options
+  ),
+  [{certfile, CertFile} | Filtered];
+replace_props(CertFile, KeyFile, Options) ->
+  Filtered = lists:filter(
+    fun
+      ({key,      _}) -> false;
+      ({keyfile,  _}) -> false;
+      ({cert,     _}) -> false;
+      ({certfile, _}) -> false;
+      (_) -> true
+    end,
+    Options
+  ),
+  [{certfile, CertFile}, {keyfile, KeyFile} | Filtered].
+
+%% @doc Check if a list of options has certificate and private key specified,
+%%   either in-line or as a path.
+
+-spec has_cert_key([proplists:property()]) ->
+  {cert | no_cert, key | no_key}.
+
+has_cert_key(Options) ->
+  lists:foldl(
+    fun
+      ({key,      _}, {HasCert, _HasKey}) -> {HasCert, key};
+      ({keyfile,  _}, {HasCert, _HasKey}) -> {HasCert, key};
+      ({cert,     _}, {_HasCert, HasKey}) -> {cert, HasKey};
+      ({certfile, _}, {_HasCert, HasKey}) -> {cert, HasKey};
+      (_, Acc) -> Acc
+    end,
+    {no_cert, no_key},
+    Options
+  ).
+
+%% }}}
+%%----------------------------------------------------------
+%% build_schema() {{{
+
+%% @doc Build a list of artifact schemas, appropriate for setting as
+%%   application environment parameter.
+
+-spec build_schema(toml:config()) ->
+  [Schema]
+  when Schema :: {ArtifactType, MandatoryTags, UniqueTags, KnownTokens},
+       ArtifactType :: grailbag:artifact_type(),
+       MandatoryTags :: [grailbag:tag()],
+       UniqueTags :: [grailbag:tag()],
+       KnownTokens :: [grailbag:token()].
+
+build_schema(TOMLConfig) ->
+  SchemaMapInit = lists:foldl(
+    fun(Name, Acc) ->
+      Schema = build_schema(Name, ["artifacts", Name], TOMLConfig),
+      dict:store(Name, Schema, Acc)
+    end,
+    dict:new(),
+    toml:sections(["artifacts"], TOMLConfig)
+  ),
+  case toml:get_value(["artifacts"], "schema", TOMLConfig) of
+    {string, SchemaFile} ->
+      case toml:read_file(SchemaFile, {fun schema_config_validate/4, []}) of
+        {ok, SchemaTOML} ->
+          SchemaMap = lists:foldl(
+            fun(Name, Acc) ->
+              Schema = build_schema(Name, [Name], SchemaTOML),
+              dict:store(Name, Schema, Acc)
+            end,
+            SchemaMapInit,
+            toml:sections([], SchemaTOML)
+          ),
+          lists:sort(dict:fold(fun(_,V,Acc) -> [V | Acc] end, [], SchemaMap));
+        {error, Reason} ->
+          Message = toml:format_error(Reason),
+          erlang:throw({error, {schema, toml, Message, SchemaFile}})
+      end;
+    none ->
+      lists:sort(dict:fold(fun(_,V,Acc) -> [V | Acc] end, [], SchemaMapInit))
+  end.
+
+%% @doc Build a single entry for `schema' list in application environment.
+%%
+%% @see build_schema/1
+
+-spec build_schema(string(), toml:section(), toml:config()) ->
+  Schema
+  when Schema :: {ArtifactType, MandatoryTags, UniqueTags, KnownTokens},
+       ArtifactType :: grailbag:artifact_type(),
+       MandatoryTags :: [grailbag:tag()],
+       UniqueTags :: [grailbag:tag()],
+       KnownTokens :: [grailbag:token()].
+
+build_schema(Name, Section, TOMLConfig) ->
+  {_, MandatoryTags} = toml:get_value(Section, "mandatory_tags", TOMLConfig, {data, []}),
+  {_, UniqueTags}    = toml:get_value(Section, "unique_tags",    TOMLConfig, {data, []}),
+  {_, KnownTokens}   = toml:get_value(Section, "tokens",         TOMLConfig, {data, []}),
+  % NOTE: tags and tokens are already binaries and are sorted
+  {list_to_binary(Name), MandatoryTags, UniqueTags, KnownTokens}.
 
 %% }}}
 %%----------------------------------------------------------
