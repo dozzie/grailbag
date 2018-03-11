@@ -4,6 +4,7 @@
   {registered, [
     grailbag_sup,
     grailbag_log,
+    grailbag_auth,
     grailbag_reg,
     grailbag_artifact_sup,
     grailbag_tcp_sup,

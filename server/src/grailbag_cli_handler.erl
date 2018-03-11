@@ -545,21 +545,21 @@ build_app_env(TOMLConfig) ->
   AppEnv = make_proplist(TOMLConfig, InitEnv, [
     % XXX: [artifacts] section is handled separately by `build_schema()'
     % XXX: [network] section is handled separately by `build_listen_addrs()'
-    %{["users"], "auth_script",  auth_script},
-    %{["users"], "protocol",     auth_protocol},
-    %{["users"], "workers",      auth_workers},
+    {["users"], "auth_script",  auth_script},
+    {["users"], "protocol",     auth_protocol},
+    {["users"], "workers",      auth_workers},
     {["storage"], "data_dir",   data_dir},
     {["logging"], "handlers",   log_handlers},
     {["logging"], "erlang_log", error_logger_file}
   ]),
   % check required options that have no good default values (mainly, paths to
   % things)
-  Mandatory = [data_dir], % plus: `[auth_script, auth_protocol]'
+  Mandatory = [auth_script, auth_protocol, data_dir],
   case app_env_defined(Mandatory, AppEnv) of
     ok -> {ok, AppEnv};
     % compare `make_proplist()' call above
-    %{missing, auth_script}   -> {error, {missing, ["users"], "auth_script"}};
-    %{missing, auth_protocol} -> {error, {missing, ["users"], "protocol"}};
+    {missing, auth_script}   -> {error, {missing, ["users"], "auth_script"}};
+    {missing, auth_protocol} -> {error, {missing, ["users"], "protocol"}};
     {missing, data_dir}      -> {error, {missing, ["storage"], "data_dir"}}
   end.
 
