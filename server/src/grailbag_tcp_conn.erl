@@ -409,7 +409,6 @@ handle_info({ssl, Socket, Data} = _Message,
       end;
     % TODO: `{watch, Type, ...}' (long running)
     {info, ID} ->
-      % TODO: check if the artifact conforms to its schema
       Reply = case grailbag_reg:info(ID) of
         {ok, Info} -> encode_info(Info);
         undefined -> encode_error(unknown_artifact)
@@ -422,7 +421,6 @@ handle_info({ssl, Socket, Data} = _Message,
           {stop, normal, State}
       end;
     {get, ID} -> % potentially long running connection
-      % TODO: check if the artifact conforms to its schema
       case grailbag_artifact:open(ID) of
         {ok, Handle} ->
           {ok, {_, _, FileSize, _, _, _, _, _, _} = Info} = grailbag_reg:info(ID),
