@@ -655,7 +655,7 @@ encode_error({schema, UnknownTokenNames}) ->
        UnsetTokens :: [grailbag:token()].
 
 decode_request(<<"S", TypeLen:16, Type:TypeLen/binary,
-               NTags:32, TagsData/binary>>) ->
+                 NTags:32, TagsData/binary>>) ->
   case decode_tag_pairs(NTags, [], TagsData) of
     {Tags, <<>>} -> {store, Type, Tags};
     _ -> {error, badarg} % either a decode error or non-zero remaining data
@@ -663,7 +663,7 @@ decode_request(<<"S", TypeLen:16, Type:TypeLen/binary,
 decode_request(<<"D", UUID:128/bitstring>>) ->
   {delete, decode_id(UUID)};
 decode_request(<<"A", UUID:128/bitstring,
-               NSTags:32, NUTags:32, TagsData/binary>>) ->
+                 NSTags:32, NUTags:32, TagsData/binary>>) ->
   case decode_tag_pairs(NSTags, [], TagsData) of
     {SetTags, UnsetTagsData} ->
       case decode_names(NUTags, [], UnsetTagsData) of
@@ -674,7 +674,7 @@ decode_request(<<"A", UUID:128/bitstring,
       {error, badarg}
   end;
 decode_request(<<"O", UUID:128/bitstring,
-               NSTokens:32, NUTokens:32, TokensData/binary>>) ->
+                 NSTokens:32, NUTokens:32, TokensData/binary>>) ->
   case decode_names(NSTokens, [], TokensData) of
     {SetTokens, UnsetTokensData} ->
       case decode_names(NUTokens, [], UnsetTokensData) of
