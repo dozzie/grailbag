@@ -42,6 +42,8 @@ format(_UUID) ->
 -spec parse(string()) ->
   uuid().
 
+parse("00000000-0000-0000-0000-000000000000" = _UUID) ->
+  <<0:128>>;
 parse(UUID) ->
   case re:run(UUID, ?UUID_RE, [dollar_endonly, {capture, none}]) of
     match ->
