@@ -310,7 +310,7 @@ decode_binary_perms(Count, <<_Fill:3, C:1,R:1,U:1,D:1,T:1,
     P ||
     {1, P} <- [{C,create}, {R,read}, {U,update}, {D,delete}, {T,tokens}]
   ],
-  [{Type, Perms} | decode_binary_perms(Count - 1, Rest)];
+  [{binary:copy(Type), Perms} | decode_binary_perms(Count - 1, Rest)];
 decode_binary_perms(_Count, _Perms) ->
   erlang:throw(bad_format).
 
