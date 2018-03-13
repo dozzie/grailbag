@@ -1,6 +1,7 @@
 #!/usr/bin/python
 
 import optparse
+import getpass
 import socket
 import ssl
 import errno
@@ -35,6 +36,18 @@ parser.add_option(
 )
 
 parser.add_option(
+    "--user", dest = "user",
+    help = "authentication user name", metavar = "USER",
+)
+parser.add_option(
+    "--password-fd", dest = "passwd_source", type = "int",
+    help = "file descriptor to read password from", metavar = "NUM",
+)
+parser.add_option(
+    "--password-file", dest = "passwd_source",
+    help = "file to read password from", metavar = "PATH",
+)
+parser.add_option(
     "--server", dest = "server",
     default = "localhost:3255",
     help = "server address", metavar = "ADDR",
@@ -52,6 +65,22 @@ if len(args) == 0:
 operation = args[0]
 del args[0]
 
+if options.user is None:
+    options.user = getpass.getuser()
+
+try:
+    if isinstance(options.passwd_source, (int, long)):
+        with os.fdopen(options.passwd_source, 'r') as passfile:
+            options.password = passfile.readline().rstrip("\n")
+    elif isinstance(options.passwd_source, (str, unicode)):
+        with open(options.passwd_source) as passfile:
+            options.password = passfile.readline().rstrip("\n")
+    else: # options.passwd_source is None:
+        options.password = \
+            getpass.getpass("password for %s: " % (options.user,))
+except KeyboardInterrupt:
+    sys.exit()
+
 # }}}
 #-----------------------------------------------------------------------------
 # GrailBagServer {{{
@@ -61,6 +90,14 @@ del args[0]
 
 class GrailBagException(Exception):
     pass
+
+class AuthenticationError(GrailBagException):
+    def __str__(self):
+        return "authentication error: invalid user or password"
+
+class PermissionError(GrailBagException):
+    def __str__(self):
+        return "authorization error: operation not permitted"
 
 class NetworkError(GrailBagException):
     def __init__(self, exception):
@@ -294,6 +331,14 @@ class RespBuffer:
         if tag == 3:
             return (TAG_TYPES, size)
 
+        if tag == 13:
+            code = size >> 16
+            if code == 0:
+                raise AuthenticationError()
+            elif code == 1:
+                raise PermissionError()
+            raise ProtocolError("unrecognized request error code: %d", code)
+
         if tag == 14: # server error
             event_id = self.uuid()
             raise ServerError(event_id)
@@ -488,9 +533,12 @@ class GrailBagServer:
     # }}}
     #------------------------------------------------------
 
-    def __init__(self, host, port = 3255, ca_file = None, timeout = 5):
+    def __init__(self, host, port = 3255, user = None, password = None,
+                 ca_file = None, timeout = 5):
         self.host = host
         self.port = port
+        self.user = user
+        self.password = password
         self.timeout = timeout
         self.conn = None
         self.ca_file = ca_file
@@ -524,6 +572,7 @@ class GrailBagServer:
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 9)
 
         self.conn = conn
+        self.authenticate()
 
     def _close(self):
         if self.conn is not None:
@@ -604,6 +653,24 @@ class GrailBagServer:
 
     # }}}
     #------------------------------------------------------
+
+    def authenticate(self):
+        if self.op_in_progress:
+            raise Exception("another GrailBagServer operation in progress")
+
+        request = ReqBuffer("l")
+        request.add_str16(self.user)
+        request.add_str16(self.password)
+
+        reply = self._send(request)
+        (tag, info) = reply.start_reading()
+
+        if tag is TAG_OK:
+            return
+
+        # NOTE: authentication errors are raised in `reply.start_reading()'
+
+        raise ProtocolError("unexpected reply (tag %s)", tag)
 
     def store(self, artifact_type, tags):
         if self.op_in_progress:
@@ -1082,9 +1149,17 @@ if not OPERATIONS[operation]["nargs"](len(args)):
 if ":" in options.server:
     (host, port) = options.server.split(":")
     port = int(port)
-    server = GrailBagServer(host = host, port = port, ca_file = options.ca_file)
+    server = GrailBagServer(
+        host = host, port = port,
+        user = options.user, password = options.password,
+        ca_file = options.ca_file,
+    )
 else:
-    server = GrailBagServer(host = options.server, ca_file = options.ca_file)
+    server = GrailBagServer(
+        host = options.server,
+        user = options.user, password = options.password,
+        ca_file = options.ca_file
+    )
 
 try:
     ret = OPERATIONS[operation]["op"](server, *args)

@@ -1,6 +1,10 @@
 %%%---------------------------------------------------------------------------
 %%% @doc
 %%%   Client connection worker.
+%%%
+%%% @todo FIXME: don't rely on {@link gen_server} catching `erlang:throw()'
+%%%   for permission checking (plus remove a race condition between STORE,
+%%%   registering an artifact, and permission checking).
 %%% @end
 %%%---------------------------------------------------------------------------
 
@@ -23,15 +27,20 @@
 %%% types {{{
 
 -define(READ_CHUNK_SIZE, 16384). % 16kB
+-define(NULL_ID, <<"00000000-0000-0000-0000-000000000000">>).
 
 -record(state, {
   socket :: ssl:sslsocket() | undefined,
+  user :: grailbag_auth:username() | undefined,
+  perms :: perms_map() | undefined,
   read_left :: undefined | grailbag:file_size(),
   upload_hash :: undefined | grailbag:body_hash(),
   handle :: undefined
           | {upload, grailbag:artifact_id(), grailbag_artifact:write_handle()}
           | {download, grailbag:artifact_id(), grailbag_artifact:read_handle()}
 }).
+
+-type perms_map() :: term().
 
 %%% }}}
 %%%---------------------------------------------------------------------------
@@ -283,9 +292,40 @@ handle_info({ssl, Socket, Data} = _Message,
   end;
 
 handle_info({ssl, Socket, Data} = _Message,
-            State = #state{socket = Socket, handle = undefined}) ->
+            State = #state{socket = Socket, handle = undefined,
+                           user = User, perms = Perms}) ->
   case decode_request(Data) of
+    {authenticate, ReqUser, _ReqPassword} when User /= undefined ->
+      grailbag_log:info("authentication failure",
+                        [{new_user, ReqUser}, {error, reauth_attempt}]),
+      ssl:send(Socket, encode_error(auth_error)),
+      {stop, normal, State};
+    {authenticate, ReqUser, ReqPassword} when User == undefined ->
+      {ok, {IP, _Port}} = ssl:peername(Socket),
+      case grailbag_auth:authenticate(ReqUser, ReqPassword, IP) of
+        {ok, NewPermsList} ->
+          grailbag_log:append_context([{user, ReqUser}]),
+          Reply = encode_success(?NULL_ID),
+          NewState = State#state{
+            user = ReqUser,
+            perms = build_perms_map(NewPermsList)
+          },
+          case ssl:send(Socket, Reply) of
+            ok ->
+              ssl:setopts(Socket, [{active, once}]),
+              {noreply, NewState};
+            {error, _} ->
+              {stop, normal, NewState}
+          end;
+        {error, Reason} ->
+          grailbag_log:info("authentication failure",
+                            [{user, ReqUser}, {error, Reason}]),
+          ssl:send(Socket, encode_error(auth_error)),
+          {stop, normal, State}
+      end;
+    % TODO: `whoami'
     {store, Type, Tags} -> % long running connection
+      check_perms(store, Type, State),
       case grailbag_reg:check_tags(Type, Tags) of
         ok ->
           case grailbag_artifact:create(Type, Tags) of
@@ -325,6 +365,7 @@ handle_info({ssl, Socket, Data} = _Message,
           {stop, normal, NewState}
       end;
     {delete, ID} ->
+      check_artifact_perms(delete, ID, State),
       Reply = case grailbag_reg:delete(ID) of
         ok ->
           grailbag_log:info("deleted an artifact", [
@@ -344,6 +385,7 @@ handle_info({ssl, Socket, Data} = _Message,
           {stop, normal, State}
       end;
     {update_tags, ID, Tags, UnsetTags} ->
+      check_artifact_perms(update_tags, ID, State),
       Reply = case grailbag_reg:update_tags(ID, Tags, UnsetTags) of
         ok ->
           grailbag_log:info("updated tags of an artifact", [
@@ -365,6 +407,7 @@ handle_info({ssl, Socket, Data} = _Message,
           {stop, normal, State}
       end;
     {update_tokens, ID, Tokens, UnsetTokens} ->
+      check_artifact_perms(update_tokens, ID, State),
       Reply = case grailbag_reg:update_tokens(ID, Tokens, UnsetTokens) of
         ok ->
           grailbag_log:info("updated tokens of an artifact", [
@@ -385,8 +428,15 @@ handle_info({ssl, Socket, Data} = _Message,
         {error, _} ->
           {stop, normal, State}
       end;
+    list_types when User == undefined ->
+      ssl:send(Socket, encode_error(perm_error)),
+      {stop, normal, State};
     list_types ->
-      Types = grailbag_reg:list(),
+      Types = [
+        Type ||
+        Type <- grailbag_reg:list(),
+        has_permission(list_types, Type, Perms)
+      ],
       Reply = encode_types_list(Types),
       case ssl:send(Socket, Reply) of
         ok ->
@@ -396,6 +446,7 @@ handle_info({ssl, Socket, Data} = _Message,
           {stop, normal, State}
       end;
     {list, Type} ->
+      check_perms(list, Type, State),
       Reply = case grailbag_reg:known_type(Type) of
         true -> encode_list(grailbag_reg:list(Type));
         false -> encode_error(unknown_type)
@@ -409,6 +460,7 @@ handle_info({ssl, Socket, Data} = _Message,
       end;
     % TODO: `{watch, Type, ...}' (long running)
     {info, ID} ->
+      check_artifact_perms(info, ID, State),
       Reply = case grailbag_reg:info(ID) of
         {ok, Info} -> encode_info(Info);
         undefined -> encode_error(unknown_artifact)
@@ -421,6 +473,7 @@ handle_info({ssl, Socket, Data} = _Message,
           {stop, normal, State}
       end;
     {get, ID} -> % potentially long running connection
+      check_artifact_perms(get, ID, State),
       case grailbag_artifact:open(ID) of
         {ok, Handle} ->
           {ok, {_, _, FileSize, _, _, _, _, _, _} = Info} = grailbag_reg:info(ID),
@@ -485,6 +538,94 @@ code_change(_OldVsn, State, _Extra) ->
 
 %% }}}
 %%----------------------------------------------------------
+
+-spec check_artifact_perms(atom(), grailbag:artifact_id(), #state{}) ->
+  ok | no_return().
+
+check_artifact_perms(_Operation, _ID,
+                     State = #state{socket = Socket, user = undefined}) ->
+  Reply = encode_error(perm_error),
+  case ssl:send(Socket, Reply) of
+    ok -> erlang:throw({noreply, State, 0});
+    {error, _} -> erlang:throw({stop, normal, State})
+  end;
+check_artifact_perms(Operation, ID, State) ->
+  % XXX: we have here a race condition possible here, but we're assuming that
+  % the user cannot guess an UUID that will be stored between call to
+  % `grailbag_reg:info()' here and change operation later (which is not
+  % totally true, because UUID can be read from the disk storage before it
+  % gets registered after upload)
+  case grailbag_reg:info(ID) of
+    {ok, {_, Type, _, _, _, _, _, _, _}} ->
+      check_perms(Operation, Type, State);
+    undefined ->
+      ok
+  end.
+
+-spec check_perms(atom(), grailbag:artifact_type(), #state{}) ->
+  ok | no_return().
+
+check_perms(_Operation, _ArtifactType,
+            State = #state{socket = Socket, user = undefined}) ->
+  Reply = encode_error(perm_error),
+  case ssl:send(Socket, Reply) of
+    ok -> erlang:throw({noreply, State, 0});
+    {error, _} -> erlang:throw({stop, normal, State})
+  end;
+check_perms(Operation, ArtifactType,
+            State = #state{socket = Socket, perms = Perms}) ->
+  case has_permission(Operation, ArtifactType, Perms) of
+    true ->
+      ok;
+    false ->
+      Reply = encode_error(perm_error),
+      case ssl:send(Socket, Reply) of
+        ok -> erlang:throw({noreply, State, 0});
+        {error, _} -> erlang:throw({stop, normal, State})
+      end
+  end.
+
+%%%---------------------------------------------------------------------------
+%%% authentication and authorization
+%%%---------------------------------------------------------------------------
+
+-spec build_perms_map(PermsList :: [Perms]) ->
+  perms_map()
+  when Perms :: {grailbag:artifact_type(), [grailbag_auth:permission()]}.
+
+build_perms_map(PermsList) ->
+  sets:from_list([
+    (if AT == <<"*">> -> P; AT /= <<"*">> -> {AT, P} end) ||
+    {AT, Ps} <- PermsList,
+    P <- Ps
+  ]).
+
+-spec has_permission(Operation, grailbag:artifact_type(), perms_map()) ->
+  boolean()
+  when Operation :: store
+                  | delete
+                  | update_tags
+                  | update_tokens
+                  | list_types
+                  | list
+                  %| watch % TODO
+                  | info
+                  | get.
+
+has_permission(Operation, ArtifactType, Perms) ->
+  RequiredPerm = case Operation of
+    store         -> create;
+    delete        -> delete;
+    update_tags   -> update;
+    update_tokens -> tokens;
+    list_types    -> read;
+    list          -> read;
+    %watch         -> read; % TODO
+    info          -> read;
+    get           -> read
+  end,
+  sets:is_element(RequiredPerm, Perms) orelse
+  sets:is_element({ArtifactType, RequiredPerm}, Perms).
 
 %%%---------------------------------------------------------------------------
 %%% protocol handling
@@ -596,6 +737,8 @@ encode_token(Token) ->
 -spec encode_error(Error) ->
   binary()
   when Error :: {server_error, grailbag_uuid:uuid()}
+              | auth_error
+              | perm_error
               | unknown_artifact
               | unknown_type
               | body_checksum_mismatch
@@ -603,6 +746,10 @@ encode_token(Token) ->
               | {schema, [grailbag:tag()], [grailbag:tag()]}
               | {schema, [grailbag:token()]}.
 
+encode_error(auth_error) ->
+  <<13:4, 0:12, 0:16>>;
+encode_error(perm_error) ->
+  <<13:4, 1:12, 0:16>>;
 encode_error({server_error, EventID}) when bit_size(EventID) == 128 ->
   <<14:4, 0:28, EventID:128/bitstring>>;
 encode_error(unknown_artifact) ->
@@ -635,7 +782,9 @@ encode_error({schema, UnknownTokenNames}) ->
 %% @doc Decode request from a client.
 
 -spec decode_request(Request :: binary()) ->
-    {store, Type, Tags}
+    {authenticate, User, Password}
+  %| whoami
+  | {store, Type, Tags}
   | {delete, ID}
   | {update_tags, ID, Tags, UnsetTags}
   | {update_tokens, ID, Tokens, UnsetTokens}
@@ -650,7 +799,9 @@ encode_error({schema, UnknownTokenNames}) ->
        Tags :: [{grailbag:tag(), grailbag:tag_value()}],
        UnsetTags :: [grailbag:tag()],
        Tokens :: [grailbag:token()],
-       UnsetTokens :: [grailbag:token()].
+       UnsetTokens :: [grailbag:token()],
+       User :: binary(),
+       Password :: binary().
 
 decode_request(<<"S", TypeLen:16, Type:TypeLen/binary,
                  NTags:32, TagsData/binary>>) ->
@@ -695,6 +846,11 @@ decode_request(<<"I", UUID:128/bitstring>>) ->
   {info, decode_id(UUID)};
 decode_request(<<"G", UUID:128/bitstring>>) ->
   {get, decode_id(UUID)};
+decode_request(<<"l", ULen:16, User:ULen/binary,
+                 PLen:16, Password:PLen/binary>>) ->
+  {authenticate, User, Password};
+%decode_request(<<"w">>) ->
+%  whoami;
 decode_request(_) ->
   {error, badarg}.
 
