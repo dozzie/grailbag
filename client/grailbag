@@ -176,10 +176,14 @@ class ArtifactHasTokens(OperationError):
 
 class SchemaError(OperationError):
     def __init__(self, duplicate_tags = None, missing_tags = None,
-                 unknown_tokens = None):
+                 unknown_tokens = None, bad_tags = None, bad_tokens = None,
+                 bad_artifact_type = None):
         self.dups = duplicate_tags
         self.missing = missing_tags
         self.unknown = unknown_tokens
+        self.bad_tags = bad_tags
+        self.bad_tokens = bad_tokens
+        self.bad_artifact_type = bad_artifact_type
 
     def __str__(self):
         message = "schema validation error:"
@@ -189,6 +193,12 @@ class SchemaError(OperationError):
             message += "\n  missing mandatory tags: " + ", ".join(self.missing)
         if self.unknown is not None:
             message += "\n  unrecognized tokens: " + ", ".join(self.unknown)
+        if self.bad_tags is not None:
+            message += "\n  invalid tag names: " + ", ".join(self.bad_tags)
+        if self.bad_tokens is not None:
+            message += "\n  invalid token names: " + ", ".join(self.bad_tokens)
+        if self.bad_artifact_type is not None:
+            message += "\n  invalid artifact type: " + self.bad_artifact_type
         return message
 
 # }}}
@@ -628,17 +638,24 @@ class GrailBagServer:
         dups = []
         missing = []
         unknown = []
+        bad_tags = []
+        bad_tokens = []
+        bad_type = [] # this type of error should only be reported once
+        errors = {
+            1: dups,
+            2: missing,
+            3: unknown,
+            4: bad_tags,
+            5: bad_tokens,
+            6: bad_type,
+        }
 
         nerrors = reply.int16()
         for i in xrange(nerrors):
             err_type = reply.int8()
             name = reply.str16()
-            if err_type == 1:
-                dups.append(name)
-            elif err_type == 2:
-                missing.append(name)
-            elif err_type == 3:
-                unknown.append(name)
+            if err_type in errors:
+                errors[err_type].append(name)
             else:
                 raise ProtocolError("unrecognized schema error tag: %d", err_type)
 
@@ -648,8 +665,24 @@ class GrailBagServer:
             missing = None
         if len(unknown) == 0:
             unknown = None
+        if len(bad_tags) == 0:
+            bad_tags = None
+        if len(bad_tokens) == 0:
+            bad_tokens = None
+        if len(bad_type) > 0:
+            # only one of this kind should be reported
+            bad_type = bad_type[0]
+        else:
+            bad_type = None
 
-        return (dups, missing, unknown)
+        return SchemaError(
+            duplicate_tags    = dups,
+            missing_tags      = missing,
+            unknown_tokens    = unknown,
+            bad_tags          = bad_tags,
+            bad_tokens        = bad_tokens,
+            bad_artifact_type = bad_type,
+        )
 
     # }}}
     #------------------------------------------------------
@@ -698,12 +731,10 @@ class GrailBagServer:
             raise UnknownType(artifact_type)
 
         if tag is TAG_ERROR and info is ERR_CODE_SCHEMA:
-            # let's hope the server doesn't report any token errors (it should
-            # not, but we won't check that)
-            (dups, missing, _) = GrailBagServer._decode_schema_errors(reply)
+            error = GrailBagServer._decode_schema_errors(reply)
             if not reply.empty():
                 raise ProtocolError("unexpected message payload")
-            raise SchemaError(duplicate_tags = dups, missing_tags = missing)
+            raise error
 
         raise ProtocolError("unexpected reply (tag %s)", tag)
 
@@ -759,12 +790,10 @@ class GrailBagServer:
             raise UnknownArtifact(artifact_id)
 
         if tag is TAG_ERROR and info is ERR_CODE_SCHEMA:
-            # let's hope the server doesn't report any token errors (it should
-            # not, but we won't check that)
-            (dups, missing, _) = GrailBagServer._decode_schema_errors(reply)
+            error = GrailBagServer._decode_schema_errors(reply)
             if not reply.empty():
                 raise ProtocolError("unexpected message payload")
-            raise SchemaError(duplicate_tags = dups, missing_tags = missing)
+            raise error
 
         raise ProtocolError("unexpected reply (tag %s)", tag)
 
@@ -795,12 +824,10 @@ class GrailBagServer:
             raise UnknownArtifact(artifact_id)
 
         if tag is TAG_ERROR and info is ERR_CODE_SCHEMA:
-            # let's hope the server doesn't report any tag errors (it should
-            # not, but we won't check that)
-            (_, _, unknown) = GrailBagServer._decode_schema_errors(reply)
+            error = GrailBagServer._decode_schema_errors(reply)
             if not reply.empty():
                 raise ProtocolError("unexpected message payload")
-            raise SchemaError(unknown_tokens = unknown)
+            raise error
 
         raise ProtocolError("unexpected reply (tag %s)", tag)
 
@@ -871,6 +898,12 @@ class GrailBagServer:
 
         if tag is TAG_ERROR and info is ERR_CODE_NXTYPE:
             raise UnknownType(artifact_type)
+
+        if tag is TAG_ERROR and info is ERR_CODE_SCHEMA:
+            error = GrailBagServer._decode_schema_errors(reply)
+            if not reply.empty():
+                raise ProtocolError("unexpected message payload")
+            raise error
 
         raise ProtocolError("unexpected reply (tag %s)", tag)
 

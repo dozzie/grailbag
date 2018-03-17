@@ -6,6 +6,7 @@
 -module(grailbag).
 
 %% public interface
+-export([valid/2]).
 -export([timestamp/0]).
 -export([format_address/1]).
 
@@ -49,6 +50,22 @@
 %%%---------------------------------------------------------------------------
 %%% public interface
 %%%---------------------------------------------------------------------------
+
+-define(TAG_RE,   "^[a-zA-Z0-9_][a-zA-Z0-9_.@%+-]*$").
+-define(TOKEN_RE, ?TAG_RE).
+-define(TYPE_RE,  ?TAG_RE).
+
+%% @doc Check if a name of tag, token, or artifact type is a valid one.
+
+-spec valid(tag | token | type, string() | binary()) ->
+  boolean().
+
+valid(tag = _Type, Name) ->
+  match == re:run(Name, ?TAG_RE, [dollar_endonly, {capture, none}]);
+valid(token = _Type, Name) ->
+  match == re:run(Name, ?TOKEN_RE, [dollar_endonly, {capture, none}]);
+valid(type = _Type, Name) ->
+  match == re:run(Name, ?TYPE_RE, [dollar_endonly, {capture, none}]).
 
 %% @doc Return current OS time.
 

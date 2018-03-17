@@ -326,6 +326,8 @@ handle_info({ssl, Socket, Data} = _Message,
     % TODO: `whoami'
     {store, Type, Tags} -> % long running connection
       check_perms(store, Type, State),
+      check_artifact_type(Type, State),
+      check_tags([T || {T,_} <- Tags], State),
       case grailbag_reg:check_tags(Type, Tags) of
         ok ->
           case grailbag_artifact:create(Type, Tags) of
@@ -386,6 +388,7 @@ handle_info({ssl, Socket, Data} = _Message,
       end;
     {update_tags, ID, Tags, UnsetTags} ->
       check_artifact_perms(update_tags, ID, State),
+      check_tags([T || {T,_} <- Tags] ++ UnsetTags, State),
       Reply = case grailbag_reg:update_tags(ID, Tags, UnsetTags) of
         ok ->
           grailbag_log:info("updated tags of an artifact", [
@@ -408,6 +411,7 @@ handle_info({ssl, Socket, Data} = _Message,
       end;
     {update_tokens, ID, Tokens, UnsetTokens} ->
       check_artifact_perms(update_tokens, ID, State),
+      check_tokens(Tokens, State),
       Reply = case grailbag_reg:update_tokens(ID, Tokens, UnsetTokens) of
         ok ->
           grailbag_log:info("updated tokens of an artifact", [
@@ -447,6 +451,7 @@ handle_info({ssl, Socket, Data} = _Message,
       end;
     {list, Type} ->
       check_perms(list, Type, State),
+      check_artifact_type(Type, State),
       Reply = case grailbag_reg:known_type(Type) of
         true -> encode_list(grailbag_reg:list(Type));
         false -> encode_error(unknown_type)
@@ -579,6 +584,51 @@ check_perms(Operation, ArtifactType,
       ok;
     false ->
       Reply = encode_error(perm_error),
+      case ssl:send(Socket, Reply) of
+        ok -> erlang:throw({noreply, State, 0});
+        {error, _} -> erlang:throw({stop, normal, State})
+      end
+  end.
+
+-spec check_tags([grailbag:tag()], #state{}) ->
+  ok | no_return().
+
+check_tags(Tags, State = #state{socket = Socket}) ->
+  case lists:filter(fun(T) -> not grailbag:valid(tag, T) end, Tags) of
+    [] ->
+      ok;
+    [_|_] = Errors ->
+      Reply = encode_error({bad_tags, Errors}),
+      case ssl:send(Socket, Reply) of
+        ok -> erlang:throw({noreply, State, 0});
+        {error, _} -> erlang:throw({stop, normal, State})
+      end
+  end.
+
+-spec check_tokens([grailbag:token()], #state{}) ->
+  ok | no_return().
+
+check_tokens(Tokens, State = #state{socket = Socket}) ->
+  case lists:filter(fun(T) -> not grailbag:valid(token, T) end, Tokens) of
+    [] ->
+      ok;
+    [_|_] = Errors ->
+      Reply = encode_error({bad_tokens, Errors}),
+      case ssl:send(Socket, Reply) of
+        ok -> erlang:throw({noreply, State, 0});
+        {error, _} -> erlang:throw({stop, normal, State})
+      end
+  end.
+
+-spec check_artifact_type(grailbag:artifact_type(), #state{}) ->
+  ok | no_return().
+
+check_artifact_type(Type, State = #state{socket = Socket}) ->
+  case grailbag:valid(type, Type) of
+    true ->
+      ok;
+    false ->
+      Reply = encode_error({bad_type, Type}),
       case ssl:send(Socket, Reply) of
         ok -> erlang:throw({noreply, State, 0});
         {error, _} -> erlang:throw({stop, normal, State})
@@ -744,7 +794,10 @@ encode_token(Token) ->
               | body_checksum_mismatch
               | artifact_has_tokens
               | {schema, [grailbag:tag()], [grailbag:tag()]}
-              | {schema, [grailbag:token()]}.
+              | {schema, [grailbag:token()]}
+              | {bad_tags, [grailbag:tag()]}
+              | {bad_tokens, [grailbag:token()]}
+              | {bad_type, grailbag:artifact_type()}.
 
 encode_error(auth_error) ->
   <<13:4, 0:12, 0:16>>;
@@ -773,6 +826,24 @@ encode_error({schema, UnknownTokenNames}) ->
     [<<3:8, (size(Token)):16>>, Token] ||
     Token <- UnknownTokenNames
   ]),
+  <<15:4, 4:12, NErrors:16, Errors/binary>>;
+encode_error({bad_tags, InvalidTagNames}) ->
+  NErrors = length(InvalidTagNames),
+  Errors = iolist_to_binary([
+    [<<4:8, (size(Tag)):16>>, Tag] ||
+    Tag <- InvalidTagNames
+  ]),
+  <<15:4, 4:12, NErrors:16, Errors/binary>>;
+encode_error({bad_tokens, InvalidTokenNames}) ->
+  NErrors = length(InvalidTokenNames),
+  Errors = iolist_to_binary([
+    [<<5:8, (size(Token)):16>>, Token] ||
+    Token <- InvalidTokenNames
+  ]),
+  <<15:4, 4:12, NErrors:16, Errors/binary>>;
+encode_error({bad_type, InvalidTypeName}) ->
+  NErrors = 1,
+  Errors = <<6:8, (size(InvalidTypeName)):16, InvalidTypeName/binary>>,
   <<15:4, 4:12, NErrors:16, Errors/binary>>.
 
 %% }}}

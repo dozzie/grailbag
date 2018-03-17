@@ -839,10 +839,18 @@ build_schema(Name, Section, TOMLConfig) ->
                              Arg :: term()) ->
   {ok, term()} | ignore | {error, badarg}.
 
+schema_config_validate([_ArtifactType], Name, section = _Value, _Arg) ->
+  case grailbag:valid(type, Name) of
+    true -> ignore;
+    false -> {error, badarg}
+  end;
 schema_config_validate([_ArtifactType], "unique_tags", Value, _Arg) ->
   case Value of
     {array, {string, Tags}} ->
-      {ok, lists:sort([list_to_binary(T) || T <- Tags])};
+      case lists:all(fun(T) -> grailbag:valid(tag, T) end, Tags) of
+        true -> {ok, lists:sort([list_to_binary(T) || T <- Tags])};
+        false -> {error, badarg}
+      end;
     {array, {empty, []}} ->
       {ok, []};
     _ ->
@@ -851,7 +859,10 @@ schema_config_validate([_ArtifactType], "unique_tags", Value, _Arg) ->
 schema_config_validate([_ArtifactType], "mandatory_tags", Value, _Arg) ->
   case Value of
     {array, {string, Tags}} ->
-      {ok, lists:sort([list_to_binary(T) || T <- Tags])};
+      case lists:all(fun(T) -> grailbag:valid(tag, T) end, Tags) of
+        true -> {ok, lists:sort([list_to_binary(T) || T <- Tags])};
+        false -> {error, badarg}
+      end;
     {array, {empty, []}} ->
       {ok, []};
     _ ->
@@ -860,7 +871,10 @@ schema_config_validate([_ArtifactType], "mandatory_tags", Value, _Arg) ->
 schema_config_validate([_ArtifactType], "tokens", Value, _Arg) ->
   case Value of
     {array, {string, Tokens}} ->
-      {ok, lists:sort([list_to_binary(T) || T <- Tokens])};
+      case lists:all(fun(T) -> grailbag:valid(token, T) end, Tokens) of
+        true -> {ok, lists:sort([list_to_binary(T) || T <- Tokens])};
+        false -> {error, badarg}
+      end;
     {array, {empty, []}} ->
       {ok, []};
     _ ->

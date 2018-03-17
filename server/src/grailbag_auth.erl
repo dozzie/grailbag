@@ -306,11 +306,17 @@ decode_binary_perms(0 = _Count, _Perms) ->
   erlang:throw(excess_data);
 decode_binary_perms(Count, <<_Fill:3, C:1,R:1,U:1,D:1,T:1,
                              TLen:16, Type:TLen/binary, Rest/binary>>) ->
-  Perms = [
-    P ||
-    {1, P} <- [{C,create}, {R,read}, {U,update}, {D,delete}, {T,tokens}]
-  ],
-  [{binary:copy(Type), Perms} | decode_binary_perms(Count - 1, Rest)];
+  case valid_artifact_type(Type) of
+    true ->
+      Perms = [
+        P ||
+        {1, P} <- [{C,create}, {R,read}, {U,update}, {D,delete}, {T,tokens}]
+      ],
+      [{binary:copy(Type), Perms} | decode_binary_perms(Count - 1, Rest)];
+    false ->
+      % just ignore invalid artifact types
+      decode_binary_perms(Count - 1, Rest)
+  end;
 decode_binary_perms(_Count, _Perms) ->
   erlang:throw(bad_format).
 
@@ -380,7 +386,9 @@ valid_json_hash_field({<<"permissions">>, PermsList},
   undefined = OldPerms,
   Perms = [
     {Type, [perm_name(PN) || PN <- PermNames]} ||
-    {Type, PermNames} <- PermsList
+    {Type, PermNames} <- PermsList,
+    % just ignore invalid artifact types
+    valid_artifact_type(Type)
   ],
   {ID, Valid, Perms, Reason};
 valid_json_hash_field({<<"error">>, Reason}, {ID, Valid, Perms, OldReason}) ->
@@ -406,6 +414,18 @@ perm_name(<<"read">>)   -> read;
 perm_name(<<"update">>) -> update;
 perm_name(<<"delete">>) -> delete;
 perm_name(<<"tokens">>) -> tokens.
+
+%% }}}
+%%----------------------------------------------------------
+%% universal decoding helpers {{{
+
+%% @doc Check if the artifact type name is valid
+
+-spec valid_artifact_type(binary()) ->
+  boolean().
+
+valid_artifact_type(<<"*">> = _Type) -> true;
+valid_artifact_type(Type) -> grailbag:valid(type, Type).
 
 %% }}}
 %%----------------------------------------------------------
