@@ -36,7 +36,10 @@ start_link() ->
 %%   instruct all the rest to re-bind themselves).
 
 -spec reload() ->
-  ok | {error, [term()]}.
+  ok | {error, [{start | reload, {Address, Port}, Reason}]}
+  when Address :: any | inet:hostname() | inet:ip_address(),
+       Port :: inet:port_number(),
+       Reason :: {resolve | listen, inet:posix()} | term().
 
 reload() ->
   {ok, NewAddrs} = application:get_env(grailbag, listen),
@@ -97,10 +100,10 @@ reload() ->
 
 %% @doc Start a missing child.
 
-start_child({_, Address, Port} = Name, SSLOpts) ->
+start_child({_, Address, Port} = _Name, SSLOpts) ->
   case supervisor:start_child(?MODULE, listen_child(Address, Port, SSLOpts)) of
     {ok, _Pid} -> ok;
-    {error, Reason} -> {start, Name, Reason}
+    {error, Reason} -> {start, {Address, Port}, Reason}
   end.
 
 %% @doc Stop an excessive child.
@@ -112,10 +115,10 @@ stop_child(Name, Pid) ->
 
 %% @doc Instruct the child to re-bind its listening socket.
 
-reload_child(Name, Pid, SSLOpts) ->
+reload_child({_, Address, Port} = _Name, Pid, SSLOpts) ->
   case grailbag_tcp_listen:rebind(Pid, SSLOpts) of
     ok -> ok;
-    {error, Reason} -> {reload, Name, Reason}
+    {error, Reason} -> {reload, {Address, Port}, Reason}
   end.
 
 %%%---------------------------------------------------------------------------
