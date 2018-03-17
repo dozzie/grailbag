@@ -23,7 +23,7 @@ parser = optparse.OptionParser(
         "\n  %prog tags   <id> -- [tags ...]" \
         "\n  %prog tokens <id> -- [tokens ...]" \
         "\n  %prog list" \
-        "\n  %prog list <type>" \
+        "\n  %prog list <type> [<type> ...]" \
         "\n  %prog info <id>" \
         "\n  %prog get  <id> <filename>" \
         "\n  %prog whoami"
@@ -1109,10 +1109,10 @@ def op_tokens(server, artifact_id, *tokens):
 
 # }}}
 #------------------------------------------------------
-# LIST [type] {{{
+# LIST [type ...] {{{
 
-def op_list(server, artifact_type = None):
-    if artifact_type is None:
+def op_list(server, *artifact_types):
+    if len(artifact_types) == 0:
         types = server.types()
         if len(types) == 0:
             print "# no known artifact types"
@@ -1123,13 +1123,16 @@ def op_list(server, artifact_type = None):
                 print "- " + yaml_string(t)
         return
 
-    artifacts = server.artifacts(artifact_type)
-    if len(artifacts) == 0:
-        print "# no artifacts"
-        print "--- {}"
-    else:
+    printed_artifacts = 0
+    for atype in artifact_types:
+        artifacts = server.artifacts(atype)
+        printed_artifacts += len(artifacts)
         for a in artifacts:
             print format_artifact_info(a)
+
+    if printed_artifacts == 0:
+        print "# no artifacts"
+        print "--- {}"
 
 # }}}
 #------------------------------------------------------
@@ -1247,7 +1250,7 @@ OPERATIONS = {
     "delete": {"op": op_delete, "nargs": lambda n: n == 1},
     "tags":   {"op": op_tags,   "nargs": lambda n: n >= 2},
     "tokens": {"op": op_tokens, "nargs": lambda n: n >= 2},
-    "list":   {"op": op_list,   "nargs": lambda n: n <= 1},
+    "list":   {"op": op_list,   "nargs": lambda n: n >= 0},
     "info":   {"op": op_info,   "nargs": lambda n: n == 1},
     "get":    {"op": op_get,    "nargs": lambda n: n == 2},
     "watch":  {"op": op_watch,  "nargs": lambda n: n == 1},
