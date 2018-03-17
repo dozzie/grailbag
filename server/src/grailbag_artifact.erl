@@ -90,7 +90,7 @@ create(Type, Tags) ->
   end.
 
 %%----------------------------------------------------------
-%% try_create() {{{
+%% try_create(), artifact_dir() {{{
 
 %% @doc Create a directory for an artifact.
 %%
@@ -100,21 +100,21 @@ create(Type, Tags) ->
   {ok, file:filename(), grailbag:artifact_id()} | {error, file:posix()}.
 
 try_create(DataDir, Tries) ->
-  % TODO: hash the `UUID'
   UUID = grailbag_uuid:format(grailbag_uuid:uuid4()),
-  Path = filename:join(DataDir, UUID),
-  case file:make_dir(Path) of
+  Path = artifact_dir(DataDir, UUID),
+  case filelib:ensure_dir(Path) of
     ok ->
-      {ok, Path, list_to_binary(UUID)};
-    {error, eexist} when Tries > 1 ->
-      try_create(DataDir, Tries - 1);
+      case file:make_dir(Path) of
+        ok ->
+          {ok, Path, list_to_binary(UUID)};
+        {error, eexist} when Tries > 1 ->
+          try_create(DataDir, Tries - 1);
+        {error, Reason} ->
+          {error, Reason}
+      end;
     {error, Reason} ->
       {error, Reason}
   end.
-
-%% }}}
-%%----------------------------------------------------------
-%% artifact_dir() {{{
 
 %% @doc Determine path of artifact's data directory.
 
@@ -123,7 +123,22 @@ try_create(DataDir, Tries) ->
 
 artifact_dir(ID) ->
   {ok, DataDir} = application:get_env(grailbag, data_dir),
-  filename:join(DataDir, binary_to_list(ID)).
+  artifact_dir(DataDir, ID).
+
+%% @doc Convert UUID (either artifact ID or a freshly generated string) to
+%%   a path in disk storage where the artifact is (will be) stored.
+
+-spec artifact_dir(file:filename(), grailbag:artifact_id() | string()) ->
+  file:filename().
+
+artifact_dir(DataDir, ID) when is_binary(ID) ->
+  artifact_dir(DataDir, binary_to_list(ID));
+artifact_dir(DataDir, [C1, C2, C3, C4 | Rest] = _ID)
+when ($0 =< C1 andalso C1 =< $9) orelse ($a =< C1 andalso C1 =< $f),
+     ($0 =< C2 andalso C2 =< $9) orelse ($a =< C2 andalso C2 =< $f),
+     ($0 =< C3 andalso C3 =< $9) orelse ($a =< C3 andalso C3 =< $f),
+     ($0 =< C4 andalso C4 =< $9) orelse ($a =< C4 andalso C4 =< $f) ->
+  filename:join([DataDir, [C1, C2], [C3, C4], Rest]).
 
 %% }}}
 %%----------------------------------------------------------
@@ -268,10 +283,19 @@ info(_Handle = #artifact{info = ArtifactInfo}) ->
 list() ->
   {ok, DataDir} = application:get_env(grailbag, data_dir),
   _Artifacts = [
-    list_to_binary(Name) ||
-    Name <- filelib:wildcard("????????-????-????-????-????????????", DataDir),
+    artifact_path_to_id(Name) ||
+    % XXX: the wildcard matches what `artifact_dir/2' does
+    Name <- filelib:wildcard("??/??/????-????-????-????-????????????", DataDir),
     valid_artifact_dir(filename:join(DataDir, Name))
   ].
+
+%% @doc Convert path relative to data directory to artifact ID.
+
+-spec artifact_path_to_id(file:filename()) ->
+  grailbag:artifact_id().
+
+artifact_path_to_id([C1, C2, $/, C3, C4, $/ | Rest] = _Path) ->
+  list_to_binary([C1, C2, C3, C4 | Rest]).
 
 %% @doc Validate artifact directory.
 %%
