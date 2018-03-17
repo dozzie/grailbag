@@ -51,7 +51,10 @@ reload() ->
     NewAddrs
   ),
   Current = lists:foldl(
-    fun({Name, Pid, worker, _}, Acc) -> dict:store(Name, Pid, Acc) end,
+    fun
+      ({Name, Pid, worker, _}, Acc) -> dict:store(Name, Pid, Acc);
+      ({_Name, _Pid, supervisor, _}, Acc) -> Acc
+    end,
     dict:new(),
     supervisor:which_children(?MODULE)
   ),
