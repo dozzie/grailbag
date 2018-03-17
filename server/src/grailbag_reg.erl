@@ -7,6 +7,7 @@
 %%%
 %%% @todo Don't validate an artifact against its schema on every access, only
 %%%   on updates (and on schema reloads).
+%%% @todo Implement disk storage directory changes
 %%% @end
 %%%---------------------------------------------------------------------------
 
@@ -18,6 +19,7 @@
 -export([known_type/1, check_tags/2, store/7, delete/1]).
 -export([update_tags/3, update_tokens/3]).
 -export([list/0, list/1, info/1]).
+-export([reload/0]).
 
 %% supervision tree API
 -export([start/0, start_link/0]).
@@ -49,7 +51,8 @@
 }).
 
 -record(state, {
-  tokens :: grailbag_tokendb:handle()
+  tokens :: grailbag_tokendb:handle(),
+  data_dir :: file:filename()
 }).
 
 %%% }}}
@@ -220,6 +223,17 @@ info(ID) ->
   end.
 
 %%%---------------------------------------------------------------------------
+
+%% @doc Reload schema and registry configuration.
+
+-spec reload() ->
+  ok | {error, grailbag_json:struct()}.
+
+reload() ->
+  % schema errors, disk storage loading errors
+  gen_server:call(?MODULE, reload, infinity).
+
+%%%---------------------------------------------------------------------------
 %%% supervision tree API
 %%%---------------------------------------------------------------------------
 
@@ -261,7 +275,10 @@ init(_Args) ->
       grailbag_log:info("starting artifact registry", [
         {artifacts, ets:info(?ARTIFACT_TABLE, size)}
       ]),
-      State = #state{tokens = Handle},
+      State = #state{
+        tokens = Handle,
+        data_dir = DataDir
+      },
       {ok, State};
     {error, Reason} ->
       {stop, {open_tokens_db, Reason}}
@@ -440,6 +457,30 @@ handle_call({update_tokens, ID, SetTokens, UnsetTokens} = _Request, _From,
       end;
     [] ->
       {reply, {error, bad_id}, State}
+  end;
+
+handle_call(reload = _Request, _From, State = #state{data_dir = DataDir}) ->
+  SchemaErrors = case reload_schema() of
+    ok -> [];
+    error -> [{schema, <<"some artifacts don't conform to their schema;",
+                         " see logs for details">>}]
+  end,
+  DiskStorageErrors = case application:get_env(data_dir) of
+    {ok, NewDataDir} when NewDataDir =:= DataDir ->
+      [];
+    {ok, NewDataDir} when NewDataDir =/= DataDir ->
+      % TODO: reload disk storage
+      [{disk_storage, <<"changing disk storage directory not implemented;"
+                        " keeping the old directory">>}];
+    undefined ->
+      % this should never happen, unless somebody is dabbling with the
+      % application from inside BEAM
+      [{disk_storage, <<"changing disk storage directory not implemented;"
+                        " keeping the old directory">>}]
+  end,
+  case SchemaErrors ++ DiskStorageErrors of
+    [] -> {reply, ok, State};
+    [_|_] = Errors -> {reply, {error, Errors}, State}
   end;
 
 %% unknown calls

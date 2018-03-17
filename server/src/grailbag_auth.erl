@@ -12,6 +12,7 @@
 
 %% public interface
 -export([authenticate/3]).
+-export([reload/0]).
 
 %% supervision tree API
 -export([start/0, start_link/0]).
@@ -48,7 +49,7 @@
 -record(state, {
   command :: [string(), ...], % worker's command
   proto :: json | binary,
-  workers :: pos_integer(),
+  workers :: non_neg_integer(), % zero only when restarting all workers
   active :: non_neg_integer(),
   ports :: [port()],
   rrports :: [port()],
@@ -79,6 +80,14 @@
 
 authenticate(User, Password, IP) ->
   gen_server:call(?MODULE, {authenticate, User, Password, IP}, infinity).
+
+%% @doc Reload authentication server configuration.
+
+-spec reload() ->
+  ok.
+
+reload() ->
+  gen_server:call(?MODULE, reload, infinity).
 
 %%%---------------------------------------------------------------------------
 %%% supervision tree API
@@ -172,6 +181,29 @@ handle_call({authenticate, User, Password, IP} = _Request, From,
     _:_ ->
       % serialization errors
       {reply, {error, denied}, State}
+  end;
+
+handle_call(reload = _Request, _From,
+            State = #state{command = Command, proto = Proto,
+                           workers = Workers}) ->
+  {ok, NewCommand} = application:get_env(auth_script),
+  {ok, NewProto} = application:get_env(auth_protocol),
+  {ok, NewWorkers} = application:get_env(auth_workers),
+  if
+    NewCommand =/= Command; NewProto =/= Proto ->
+      % TODO: log this
+      NewState = State#state{
+        command = NewCommand,
+        proto = NewProto
+      },
+      NewState1 = restart_all_workers(NewState),
+      {reply, ok, NewState1};
+    NewWorkers =/= Workers ->
+      % TODO: log this
+      NewState = schedule_restart(now, State),
+      {reply, ok, NewState};
+    true ->
+      {reply, ok, State}
   end;
 
 %% unknown calls
@@ -501,6 +533,20 @@ when is_reference(Timer) ->
 %%%---------------------------------------------------------------------------
 %%% worker ports
 
+%%----------------------------------------------------------
+%% restart_all_workers() {{{
+
+%% @doc Shutdown all authentication workers and schedule restarting them
+%%   immediately.
+
+-spec restart_all_workers(#state{}) ->
+  #state{}.
+
+restart_all_workers(State = #state{workers = Workers}) ->
+  NewState = start_stop_workers(State#state{workers = 0}),
+  schedule_restart(now, NewState#state{workers = Workers}).
+
+%% }}}
 %%----------------------------------------------------------
 %% start_stop_workers() {{{
 
