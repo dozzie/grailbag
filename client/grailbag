@@ -25,7 +25,8 @@ parser = optparse.OptionParser(
         "\n  %prog list" \
         "\n  %prog list <type>" \
         "\n  %prog info <id>" \
-        "\n  %prog get  <id> <filename>"
+        "\n  %prog get  <id> <filename>" \
+        "\n  %prog whoami"
 )
 
 # TODO: remove this option once WATCH is implemented server-side
@@ -294,6 +295,7 @@ TAG_OK = Constant("OK")
 TAG_OK_CHUNKSIZE = Constant("OK+CHUNKSIZE")
 TAG_INFO = Constant("INFO")
 TAG_LIST = Constant("LIST")
+TAG_WHOAMI = Constant("WHOAMI")
 TAG_TYPES = Constant("TYPES")
 TAG_ERROR = Constant("ERROR")
 TAG_SERVER_ERROR = Constant("SERVER_ERROR")
@@ -340,6 +342,9 @@ class RespBuffer:
 
         if tag == 3:
             return (TAG_TYPES, size)
+
+        if tag == 4:
+            return (TAG_WHOAMI, size)
 
         if tag == 13:
             code = size >> 16
@@ -705,6 +710,38 @@ class GrailBagServer:
 
         raise ProtocolError("unexpected reply (tag %s)", tag)
 
+    def whoami(self):
+        if self.op_in_progress:
+            raise Exception("another GrailBagServer operation in progress")
+
+        request = ReqBuffer("w")
+
+        reply = self._send(request)
+        (tag, info) = reply.start_reading()
+
+        if tag is TAG_WHOAMI:
+            nperms = info
+            user = reply.str16()
+            if user == "":
+                return (None, None)
+            perms_map = {}
+            for i in xrange(nperms):
+                perms = reply.int8()
+                name = reply.str16()
+                perms_map[name] = [
+                    perm_name
+                    for (perm_name, num) in [("create", 0x10), ("read", 0x08),
+                                             ("update", 0x04), ("delete", 0x02),
+                                             ("tokens", 0x01)]
+                    if (perms & num) != 0
+                ]
+            if not reply.empty():
+                raise ProtocolError("unexpected message payload")
+            return (user, perms_map)
+
+        raise ProtocolError("unexpected reply (tag %s)", tag)
+
+
     def store(self, artifact_type, tags):
         if self.op_in_progress:
             raise Exception("another GrailBagServer operation in progress")
@@ -982,6 +1019,23 @@ def format_artifact_info(info):
 #------------------------------------------------------
 
 #------------------------------------------------------
+# WHOAMI {{{
+
+def op_whoami(server):
+    (user, permissions) = server.whoami()
+    if user is None:
+        return
+
+    print "user: %s" % (user,)
+    if "*" in permissions:
+        print "(all artifacts): %s" % (", ".join(permissions["*"]),)
+        del permissions["*"]
+    for artifact_type in sorted(permissions):
+        perms = permissions[artifact_type]
+        print "%s: %s" % (artifact_type, ", ".join(perms))
+
+# }}}
+#------------------------------------------------------
 # STORE type filename [tags ...] {{{
 
 def op_store(server, artifact_type, filename, *tags):
@@ -1160,6 +1214,7 @@ def op_watch(server, artifact_type):
 #------------------------------------------------------
 
 OPERATIONS = {
+    "whoami": {"op": op_whoami, "nargs": lambda n: n == 0},
     "store":  {"op": op_store,  "nargs": lambda n: n >= 2},
     "delete": {"op": op_delete, "nargs": lambda n: n == 1},
     "tags":   {"op": op_tags,   "nargs": lambda n: n >= 2},

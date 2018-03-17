@@ -323,7 +323,15 @@ handle_info({ssl, Socket, Data} = _Message,
           ssl:send(Socket, encode_error(auth_error)),
           {stop, normal, State}
       end;
-    % TODO: `whoami'
+    whoami ->
+      Reply = encode_perms(User, Perms),
+      case ssl:send(Socket, Reply) of
+        ok ->
+          ssl:setopts(Socket, [{active, once}]),
+          {noreply, State};
+        {error, _} ->
+          {stop, normal, State}
+      end;
     {store, Type, Tags} -> % long running connection
       check_perms(store, Type, State),
       check_artifact_type(Type, State),
@@ -682,7 +690,7 @@ has_permission(Operation, ArtifactType, Perms) ->
 %%%---------------------------------------------------------------------------
 
 %%----------------------------------------------------------
-%% encode_success(), encode_info(), encode_list() {{{
+%% encode_success(), encode_info(), encode_list(), encode_perms() {{{
 
 %% @doc Encode "operation succeeded" message.
 
@@ -731,6 +739,49 @@ encode_types_list(Types) ->
     <<3:4, (length(Types)):28>>,
     [[<<(size(T)):16>>, T] || T <- Types]
   ].
+
+%% @doc Encode message with list of permissions for current user.
+
+-spec encode_perms(grailbag_auth:username() | undefined,
+                   perms_map() | undefined) ->
+  iolist().
+
+encode_perms(undefined = _User, undefined = _Perms) ->
+  _Result = [
+    <<4:4, 0:28>>,
+    <<0:16>> % empty username
+  ];
+encode_perms(User, Perms) ->
+  Artifacts = sets:fold(fun add_perm/2, dict:new(), Perms),
+  Encoded = dict:fold(
+    fun(Type, PermsEncoded, Acc) ->
+      [[<<PermsEncoded:8>>, <<(size(Type)):16>>, Type] | Acc]
+    end,
+    [],
+    Artifacts
+  ),
+  _Result = [
+    <<4:4, (dict:size(Artifacts)):28>>,
+    <<(size(User)):16>>, User,
+    Encoded
+  ].
+
+%% @doc Add a numeric representation of a permission to appropriate artifact
+%%   in permissions map.
+%%
+%% @see encode_perms/2
+
+add_perm(Perm, PermMap) when is_atom(Perm) ->
+  add_perm({<<"*">>, Perm}, PermMap);
+add_perm({Artifact, Perm}, PermMap) ->
+  PermVal = case Perm of
+    create -> 16#10;
+    read   -> 16#08;
+    update -> 16#04;
+    delete -> 16#02;
+    tokens -> 16#01
+  end,
+  dict:update(Artifact, fun(V) -> V bor PermVal end, PermVal, PermMap).
 
 %% @doc Encode information about a single artifact.
 %%
@@ -854,7 +905,7 @@ encode_error({bad_type, InvalidTypeName}) ->
 
 -spec decode_request(Request :: binary()) ->
     {authenticate, User, Password}
-  %| whoami
+  | whoami
   | {store, Type, Tags}
   | {delete, ID}
   | {update_tags, ID, Tags, UnsetTags}
@@ -920,8 +971,8 @@ decode_request(<<"G", UUID:128/bitstring>>) ->
 decode_request(<<"l", ULen:16, User:ULen/binary,
                  PLen:16, Password:PLen/binary>>) ->
   {authenticate, User, Password};
-%decode_request(<<"w">>) ->
-%  whoami;
+decode_request(<<"w">>) ->
+  whoami;
 decode_request(_) ->
   {error, badarg}.
 
