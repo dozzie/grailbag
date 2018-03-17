@@ -712,7 +712,7 @@ encode_artifact_info({ID, Type, FileSize, Hash, CTime, MTime, Tags, Tokens, Vali
 %%
 %% @see encode_artifact_info/1
 
--spec encode_tag(grailbag:tag(), grailbag:token()) ->
+-spec encode_tag(grailbag:tag(), grailbag:tag_value()) ->
   iolist().
 
 encode_tag(Tag, Value) ->
