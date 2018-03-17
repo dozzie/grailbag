@@ -55,7 +55,7 @@ handle_command([{<<"command">>, <<"reload_config">>}] = _Command, _Args) ->
     {error, Message} when is_binary(Message) ->
       log_error(reload, "reload error", [{error, Message}]),
       [{result, error}, {message, Message}];
-    {error, Errors} when is_list(Errors) ->
+    {error, [{_,_}|_] = Errors} ->
       log_error(reload, "reload errors", [{errors, Errors}]),
       [{result, error}, {errors, Errors}]
   catch

@@ -211,10 +211,13 @@ handle_reply(Reply, reload_config = Command, _Options) ->
     {error, Errors} ->
       printerr("reload errors:"),
       lists:foreach(
-        % FIXME: `Error' can nominally be a JSON, and in fact it sometimes is
-        % something else than binary (e.g. a list of binaries for
-        % `tcp_listen'; those will be crammed into a single line)
-        fun({Part, Error}) -> printerr(["  ", Part, ": ", Error]) end,
+        fun
+          ({Part, Error}) when is_binary(Error) ->
+            printerr(["  ", Part, ": ", Error]);
+          ({Part, Error}) ->
+            {ok, JSON} = indira_json:encode(Error),
+            printerr(["  ", Part, ": ", JSON])
+        end,
         Errors
       ),
       {error, 1}
@@ -374,7 +377,7 @@ install_error_logger_handler(ErrorLoggerLog) ->
 %%   application's processes to reread their parameters.
 
 -spec reload(file:filename()) ->
-  ok | {error, binary() | [{atom(), indira_json:struct()}]}.
+  ok | {error, binary() | indira_json:jhash()}.
 
 reload(Path) ->
   case config_load(Path) of
@@ -384,7 +387,7 @@ reload(Path) ->
           case indira:distributed_reconfigure(IndiraOpts) of
             ok ->
               ok = indira:set_env(grailbag, AppEnv),
-              ok; % TODO: reload_subsystems();
+              reload_subsystems();
             {error, Reason} ->
               Message = format_error(Reason),
               {error, iolist_to_binary(Message)}
@@ -401,45 +404,72 @@ reload(Path) ->
 %%----------------------------------------------------------
 %% reloading subsystems {{{
 
-%%% Reload all subsystems that need to be told that config was changed.
-%
-%-spec reload_subsystems() ->
-%  ok | {error, [{atom(), indira_json:struct()}]}.
-%
-%reload_subsystems() ->
-%  Subsystems = [logger, tcp_listen, schema],
-%  case lists:foldl(fun reload_subsystem/2, [], Subsystems) of
-%    [] -> ok;
-%    [_|_] = Errors -> {error, lists:reverse(Errors)}
-%  end.
-%
-%%% Workhorse for {@link reload_subsystems/0}.
-%
-%-spec reload_subsystem(atom(), list()) ->
-%  list().
-%
-%reload_subsystem(logger = Name, Errors) ->
-%  {ok, LogHandlers} = application:get_env(grailbag, log_handlers),
-%  case grailbag_log:reload(LogHandlers) of
-%    {ok, _ReloadCandidates} ->
-%      % gen_event handlers that maybe need reloading (neither
-%      % `grailbag_stdout_h' nor `grailbag_syslog_h' need it, though, and
-%      % they're the only supported handlers at this point)
-%      Errors;
-%    {error, Reason} ->
-%      [{Name, iolist_to_binary(format_term(Reason))} | Errors]
-%  end;
-%
-%reload_subsystem(tcp_listen = Name, Errors) ->
-%  case grailbag_tcp_sup:reload() of
-%    ok ->
-%      Errors;
-%    {error, TCPErrors} ->
-%      % list of errors, potentially one per socket listener
-%      [{Name, [iolist_to_binary(format_term(E)) || E <- TCPErrors]} | Errors]
-%  end;
-%
-% ...
+%% @doc Reload all subsystems that need to be told that config was changed.
+
+-spec reload_subsystems() ->
+  ok | {error, indira_json:jhash()}.
+
+reload_subsystems() ->
+  Subsystems = [logging, network, registry, authentication],
+  case lists:foldl(fun reload_subsystem/2, [], Subsystems) of
+    [] -> ok;
+    [_|_] = Errors -> {error, lists:reverse(Errors)}
+  end.
+
+%% @doc Workhorse for {@link reload_subsystems/0}.
+
+-spec reload_subsystem(atom(), indira_json:jhash()) ->
+  indira_json:jhash().
+
+reload_subsystem(logging = Name, Errors) ->
+  {ok, LogHandlers} = application:get_env(grailbag, log_handlers),
+  case grailbag_log:reload(LogHandlers) of
+    {ok, _ReloadCandidates} ->
+      % gen_event handlers that maybe need reloading (neither
+      % `grailbag_stdout_h' nor `grailbag_syslog_h' need it, though, and
+      % they're the only supported handlers at this point)
+      Errors;
+    {error, Reason} ->
+      [{Name, iolist_to_binary(format_term(Reason))} | Errors]
+  end;
+
+reload_subsystem(network = _Name, Errors) ->
+  case grailbag_tcp_sup:reload() of
+    ok ->
+      Errors;
+    {error, TCPErrors} ->
+      [format_network_error(E) || E <- TCPErrors] ++ Errors
+  end;
+
+reload_subsystem(registry = _Name, Errors) ->
+  % errors from `grailbag_reg:reload()' are proper JSON-serializable hash
+  case grailbag_reg:reload() of
+    ok -> Errors;
+    {error, RegErrors} -> RegErrors ++ Errors
+  end;
+
+reload_subsystem(authentication = _Name, Errors) ->
+  % `grailbag_auth:reload()' always succeeds, no errors to add
+  ok = grailbag_auth:reload(),
+  Errors.
+
+%% @doc Format an error reported from {@link grailbag_tcp_sup:reload/0}.
+
+format_network_error({Op, {Address, Port}, Reason} = _Error) ->
+  AddrStr = case Address of
+    any -> "*";
+    _ when is_list(Address) -> Address;
+    _ when is_atom(Address) -> atom_to_list(Address);
+    {_,_,_,_}         -> grailbag:format_address(Address);
+    {_,_,_,_,_,_,_,_} -> grailbag:format_address(Address)
+  end,
+  Name = [atom_to_list(Op), ":", AddrStr, ":", integer_to_list(Port)],
+  Formatted = case Reason of
+    {resolve, Errno} -> ["resolve: ", inet:format_error(Errno)];
+    {listen,  Errno} -> ["listen: ",  inet:format_error(Errno)];
+    _ -> format_term(Reason)
+  end,
+  {iolist_to_binary(Name), iolist_to_binary(Formatted)}.
 
 %% }}}
 %%----------------------------------------------------------
@@ -1125,15 +1155,6 @@ make_integer(String) ->
 
 println(Line) ->
   io:put_chars([Line, $\n]).
-
-%% @doc Print a JSON structure to STDOUT, ending it with a new line.
-
--spec print_json(indira_json:struct()) ->
-  ok.
-
-print_json(Struct) ->
-  {ok, JSON} = indira_json:encode(Struct),
-  io:put_chars([JSON, $\n]).
 
 %% @doc Print a string to STDERR, ending it with a new line.
 
