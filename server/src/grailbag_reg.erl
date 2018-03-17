@@ -75,7 +75,7 @@ known_type(Type) ->
                | {schema, Dup :: [grailbag:tag()], Missing :: [grailbag:tag()]}.
 
 check_tags(Type, Tags) ->
-  case grailbag_schema:verify(grailbag_schema:changes(Type, Tags, [])) of
+  case grailbag_schema:verify(grailbag_schema:new_artifact(Type, Tags)) of
     ok ->
       ok;
     {error, [{unknown_type, _}]} ->

@@ -8,7 +8,7 @@
 %% public interface
 -export([open/0, close/0]).
 -export([types/0, known_type/1]).
--export([changes/3, verify/1, store/1, store/2, delete/2]).
+-export([new_artifact/2, changes/3, verify/1, store/1, store/2, delete/2]).
 -export([verify/2, verify_tokens/2]).
 -export([reload/1, add_artifact/5, save/1, errors/1]).
 
@@ -107,8 +107,46 @@ types() ->
 known_type(Type) ->
   ets:member(?ETS_TABLE, Type).
 
+%% @doc Check if a to-be-uploaded artifact conforms to its schema.
+%%
+%% @see changes/3
+%% @see verify/1
+%% @see store/1
+
+-spec new_artifact(grailbag:artifact_type(),
+                   [{grailbag:tag(), grailbag:tag_value()}]) ->
+  schema_diff().
+
+new_artifact(Type, Tags) ->
+  case ets:lookup(?ETS_TABLE, Type) of
+    [#schema{unique = Unique, mandatory = Mandatory}] ->
+      % artificial tag values to pretend that a mandatory tag got deleted
+      % (`diff_tags()' doesn't check if old tags had collisions, so we can use
+      % here any value)
+      OldTags = [{T, <<>>} || T <- Mandatory],
+      {Set, Unset, Missing} = diff_tags(
+        lists:sort(Tags), lists:sort(OldTags),
+        sets:from_list(Unique), sets:from_list(Mandatory),
+        [], [], []
+      ),
+      _Result = #diff{
+        type = Type,
+        set = Set,
+        unset = Unset,
+        missing = Missing
+      };
+    [] ->
+      _Result = #diff{
+        type = {unknown_type, Type},
+        set = [],
+        unset = [],
+        missing = []
+      }
+  end.
+
 %% @doc Calculate differences required to record a change to an artifact.
 %%
+%% @see new_artifact/2
 %% @see verify/1
 %% @see store/1
 
@@ -140,9 +178,10 @@ changes(Type, Tags, OldTags) ->
       }
   end.
 
-%% @doc Check if recording changes to an artifact will introduce in schema
+%% @doc Check if recording changes to an artifact will introduce schema
 %%   errors.
 %%
+%% @see new_artifact/2
 %% @see changes/3
 %% @see store/1
 
