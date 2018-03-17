@@ -510,10 +510,29 @@ when is_reference(Timer) ->
 -spec start_stop_workers(#state{}) ->
   #state{}.
 
-start_stop_workers(State = #state{active = Active, workers = Workers})
+start_stop_workers(State = #state{active = Active, workers = Workers,
+                                  ports = PortsList, requests = Reqs})
 when Active == Workers ->
   cleanup_restart(State),
-  State#state{restart_timer = undefined};
+  % send `{error,denied}' to all authentication requests that got their ports
+  % closed as excessive
+  Ports = sets:from_list(PortsList),
+  NewReqs = dict:filter(
+    fun({_ReqID, Port}, ReplyTo) ->
+      case sets:is_element(Port, Ports) of
+        true ->
+          true;
+        false ->
+          gen_server:reply(ReplyTo, {error, denied}),
+          false
+      end
+    end,
+    Reqs
+  ),
+  State#state{
+    requests = NewReqs,
+    restart_timer = undefined
+  };
 start_stop_workers(State = #state{active = Active, workers = Workers,
                                   ports = [Excess | Rest]})
 when Active > Workers ->
