@@ -102,7 +102,7 @@ check_tags(Type, Tags) ->
                | {schema, Dup :: [grailbag:tag()], Missing :: [grailbag:tag()]}.
 
 store(ID, Type, BodySize, BodyHash, CTime, MTime, Tags) ->
-  ArtifactInfo = {ID, Type, BodySize, BodyHash, CTime, MTime, Tags, []},
+  ArtifactInfo = {ID, Type, BodySize, BodyHash, CTime, MTime, Tags, [], valid},
   gen_server:call(?MODULE, {store, ArtifactInfo}, infinity).
 
 %% @doc Delete an artifact from memory and from disk.
