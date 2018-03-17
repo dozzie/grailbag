@@ -489,7 +489,7 @@ code_change(_OldVsn, State, _Extra) ->
   binary().
 
 hash_init() ->
-  crypto:sha_init().
+  crypto:sha512_init().
 
 %% @doc Update hash calculation context with more data.
 
@@ -497,7 +497,7 @@ hash_init() ->
   Context :: binary().
 
 hash_update(Context, Data) ->
-  crypto:sha_update(Context, Data).
+  crypto:sha512_update(Context, Data).
 
 %% @doc Calculate end result (hash) from context.
 
@@ -505,7 +505,7 @@ hash_update(Context, Data) ->
   Hash :: binary().
 
 hash_final(Context) ->
-  crypto:sha_final(Context).
+  crypto:sha512_final(Context).
 
 %% @doc Calculate hash of data in one go.
 
