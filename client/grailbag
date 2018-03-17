@@ -993,27 +993,49 @@ class GrailBagServer:
 # operations {{{
 
 #------------------------------------------------------
+# yaml_string() {{{
+
+_ALNUM = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789")
+def yaml_string(data):
+    if len(set(data) - _ALNUM) > 0 or \
+       (len(data) > 0 and data[0] in "0123456789") or \
+       data in ["true", "false", "null"]:
+        return json.dumps(data)
+    else:
+        return data
+
+# }}}
+#------------------------------------------------------
 # format_artifact_info() {{{
 
 def format_artifact_info(info):
-    if info.valid:
-        valid = "conforming to schema"
-    else:
-        valid = "schema errors"
-    return (
-        "ID {id} type={type} <{valid}>\n"
-        "  body: size={size} SHA512={hash}\n"
-        "  ctime: [{ctime}] mtime: [{mtime}]\n"
-        "  tags: {tags}\n"
-        "  tokens: {tokens}"
+    result = (
+        '{id}:\n'
+        '  type: {type}\n'
+        '  valid: {valid}\n'
+        '  size: {size}\n'
+        '  sha512: "{hash}"\n'
+        '  ctime: "{ctime}"\n'
+        '  mtime: "{mtime}"\n'
     ).format(
-        id = info.id, type = info.type, valid = valid,
-        size = info.size, hash = info.digest.encode("hex"),
+        id = yaml_string(info.id),
+        type = yaml_string(info.type),
+        valid = ("true" if info.valid else "false"),
+        size = info.size,
+        hash = info.digest.encode("hex"),
         ctime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(info.ctime)),
         mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(info.mtime)),
-        tags = " ".join("<%s=%s>" % (n,info.tags[n]) for n in sorted(info.tags)),
-        tokens = " ".join("(%s)" % (n,) for n in info.tokens),
     )
+    if len(info.tags) == 0:
+        result += "  tags: {}\n"
+    else:
+        result += "  tags:\n"
+        result += "".join(
+            '    %s: %s\n' % (yaml_string(n), yaml_string(info.tags[n]))
+            for n in sorted(info.tags)
+        )
+    result += "  tokens: %s\n" % (json.dumps(sorted(info.tokens)),)
+    return result.rstrip("\n")
 
 # }}}
 #------------------------------------------------------
@@ -1026,13 +1048,17 @@ def op_whoami(server):
     if user is None:
         return
 
-    print "user: %s" % (user,)
-    if "*" in permissions:
-        print "(all artifacts): %s" % (", ".join(permissions["*"]),)
-        del permissions["*"]
-    for artifact_type in sorted(permissions):
-        perms = permissions[artifact_type]
-        print "%s: %s" % (artifact_type, ", ".join(perms))
+    print "user: %s" % (yaml_string(user),)
+    if len(permissions) == 0:
+        print "permissions: {}"
+    else:
+        print "permissions:"
+        if "*" in permissions:
+            print '  "*": [%s]' % (", ".join(permissions["*"]),)
+            del permissions["*"]
+        for artifact_type in sorted(permissions):
+            perms = permissions[artifact_type]
+            print "  %s: [%s]" % (yaml_string(artifact_type), ", ".join(perms))
 
 # }}}
 #------------------------------------------------------
@@ -1043,7 +1069,7 @@ def op_store(server, artifact_type, filename, *tags):
     source = open(filename, "r") if filename != "-" else sys.stdin
     with source:
         with server.store(artifact_type, set_tags) as upload:
-            print "uploading: ID=%s" % (upload.id,)
+            print "id: %s" % (yaml_string(upload.id),)
             # NOTE: `upload.chunk_size' is guaranteed to be >=4096 bytes
             chunk_size = 4096
             chunk = source.read(chunk_size)
@@ -1051,7 +1077,7 @@ def op_store(server, artifact_type, filename, *tags):
                 upload.write(chunk)
                 chunk = source.read(chunk_size)
             upload.done()
-            print "uploaded"
+            print "# uploaded"
 
 # }}}
 #------------------------------------------------------
@@ -1089,19 +1115,21 @@ def op_list(server, artifact_type = None):
     if artifact_type is None:
         types = server.types()
         if len(types) == 0:
-            print "no known artifact types"
+            print "# no known artifact types"
+            print "--- []"
         else:
-            print "artifact types:"
+            print "# known artifact types"
             for t in types:
-                print "  " + t
+                print "- " + yaml_string(t)
         return
 
     artifacts = server.artifacts(artifact_type)
-    print "known artifacts:"
-    print "---"
-    for a in artifacts:
-        print format_artifact_info(a)
-        print "---"
+    if len(artifacts) == 0:
+        print "# no artifacts"
+        print "--- {}"
+    else:
+        for a in artifacts:
+            print format_artifact_info(a)
 
 # }}}
 #------------------------------------------------------
@@ -1125,7 +1153,7 @@ def op_get(server, artifact_id, filename):
         digest = ctx.digest()
         if digest != download.info.digest:
             # TODO: react somehow (call `os.unlink(filename)'?)
-            print "digest mismatch!"
+            print >>sys.stderr, "digest mismatch!"
             return 1
         print format_artifact_info(download.info)
 
