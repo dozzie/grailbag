@@ -1,92 +1,26 @@
 #!/usr/bin/python
 
-import optparse
-import getpass
 import socket
 import ssl
+import platform
 import errno
 import os
-import platform
 import uuid
-import sys
-import time
 import hashlib
-import json
+
+__all__ = [
+    "GrailBagException",
+    "AuthenticationError", "PermissionError",
+    "NetworkError", "ProtocolError",
+    "OperationError",
+    "ServerError",
+    "UnknownArtifact", "UnknownType", "UploadChecksumMismatch",
+    "ArtifactHasTokens", "SchemaError",
+    "Artifact",
+    "Server",
+]
 
 #-----------------------------------------------------------------------------
-# command line options {{{
-
-parser = optparse.OptionParser(
-    usage = \
-        "\n  %prog store  <type> <filename> [tags ...]" \
-        "\n  %prog delete <id>" \
-        "\n  %prog tags   <id> -- [tags ...]" \
-        "\n  %prog tokens <id> -- [tokens ...]" \
-        "\n  %prog list" \
-        "\n  %prog list <type> [<type> ...]" \
-        "\n  %prog info <id>" \
-        "\n  %prog get  <id> <filename>" \
-        "\n  %prog whoami"
-)
-
-# TODO: remove this option once WATCH is implemented server-side
-parser.add_option(
-    "--interval", dest = "interval", type = "int",
-    default = 5,
-    help = "watch interval", metavar = "SECONDS",
-)
-
-parser.add_option(
-    "--user", dest = "user",
-    help = "authentication user name", metavar = "USER",
-)
-parser.add_option(
-    "--password-fd", dest = "passwd_source", type = "int",
-    help = "file descriptor to read password from", metavar = "NUM",
-)
-parser.add_option(
-    "--password-file", dest = "passwd_source",
-    help = "file to read password from", metavar = "PATH",
-)
-parser.add_option(
-    "--server", dest = "server",
-    default = "localhost:3255",
-    help = "server address", metavar = "ADDR",
-)
-parser.add_option(
-    "--ca-file", dest = "ca_file",
-    help = "CA certificate to verify against", metavar = "PATH",
-)
-
-(options, args) = parser.parse_args()
-if len(args) == 0:
-    parser.print_help()
-    sys.exit()
-
-operation = args[0]
-del args[0]
-
-if options.user is None:
-    options.user = getpass.getuser()
-
-try:
-    if isinstance(options.passwd_source, (int, long)):
-        with os.fdopen(options.passwd_source, 'r') as passfile:
-            options.password = passfile.readline().rstrip("\n")
-    elif isinstance(options.passwd_source, (str, unicode)):
-        with open(options.passwd_source) as passfile:
-            options.password = passfile.readline().rstrip("\n")
-    else: # options.passwd_source is None:
-        options.password = \
-            getpass.getpass("password for %s: " % (options.user,))
-except KeyboardInterrupt:
-    sys.exit()
-
-# }}}
-#-----------------------------------------------------------------------------
-# GrailBagServer {{{
-
-#------------------------------------------------------
 # exceptions {{{
 
 class GrailBagException(Exception):
@@ -203,10 +137,10 @@ class SchemaError(OperationError):
         return message
 
 # }}}
-#------------------------------------------------------
-# Constant {{{
+#-----------------------------------------------------------------------------
+# helper classes {{{
 
-class Constant:
+class _Constant:
     def __init__(self, name):
         self.name = name
 
@@ -216,27 +150,7 @@ class Constant:
     def __repr__(self):
         return str(self)
 
-# }}}
-#------------------------------------------------------
-# Artifact {{{
-
-class Artifact:
-    def __init__(self):
-        self.id = None
-        self.type = None
-        self.size = None
-        self.digest = None
-        self.ctime = None
-        self.mtime = None
-        self.tags = {}
-        self.tokens = []
-        self.valid = False # conforming to artifact's schema
-
-# }}}
-#------------------------------------------------------
-# ReqBuffer {{{
-
-class ReqBuffer:
+class _ReqBuffer:
     def __init__(self, content = ""):
         self.buf = bytearray(content)
 
@@ -287,26 +201,22 @@ class ReqBuffer:
     def __len__(self):
         return len(self.buf)
 
-# }}}
-#------------------------------------------------------
-# RespBuffer {{{
+_TAG_OK = _Constant("OK")
+_TAG_OK_CHUNKSIZE = _Constant("OK+CHUNKSIZE")
+_TAG_INFO = _Constant("INFO")
+_TAG_LIST = _Constant("LIST")
+_TAG_WHOAMI = _Constant("WHOAMI")
+_TAG_TYPES = _Constant("TYPES")
+_TAG_ERROR = _Constant("ERROR")
+_TAG_SERVER_ERROR = _Constant("SERVER_ERROR")
 
-TAG_OK = Constant("OK")
-TAG_OK_CHUNKSIZE = Constant("OK+CHUNKSIZE")
-TAG_INFO = Constant("INFO")
-TAG_LIST = Constant("LIST")
-TAG_WHOAMI = Constant("WHOAMI")
-TAG_TYPES = Constant("TYPES")
-TAG_ERROR = Constant("ERROR")
-TAG_SERVER_ERROR = Constant("SERVER_ERROR")
+_ERR_CODE_NXID = _Constant("UNKNOWN_ARTIFACT")
+_ERR_CODE_NXTYPE = _Constant("UNKNOWN_ARTIFACT_TYPE")
+_ERR_CODE_CHECKSUM = _Constant("BODY_CHECKSUM_MISMATCH")
+_ERR_CODE_HAS_TOKENS = _Constant("ARTIFACT_HAS_TOKENS")
+_ERR_CODE_SCHEMA = _Constant("SCHEMA_ERROR")
 
-ERR_CODE_NXID = Constant("UNKNOWN_ARTIFACT")
-ERR_CODE_NXTYPE = Constant("UNKNOWN_ARTIFACT_TYPE")
-ERR_CODE_CHECKSUM = Constant("BODY_CHECKSUM_MISMATCH")
-ERR_CODE_HAS_TOKENS = Constant("ARTIFACT_HAS_TOKENS")
-ERR_CODE_SCHEMA = Constant("SCHEMA_ERROR")
-
-class RespBuffer:
+class _RespBuffer:
     def __init__(self, size):
         self.buf = bytearray(size)
         self.write_pos = 0
@@ -329,22 +239,22 @@ class RespBuffer:
                self.buf[2] << 8 | self.buf[3]
 
         if tag == 0 and size == 0:
-            return (TAG_OK, None)
+            return (_TAG_OK, None)
 
         if tag == 0 and size > 0:
-            return (TAG_OK_CHUNKSIZE, size)
+            return (_TAG_OK_CHUNKSIZE, size)
 
         if tag == 1:
-            return (TAG_INFO, None)
+            return (_TAG_INFO, None)
 
         if tag == 2:
-            return (TAG_LIST, size)
+            return (_TAG_LIST, size)
 
         if tag == 3:
-            return (TAG_TYPES, size)
+            return (_TAG_TYPES, size)
 
         if tag == 4:
-            return (TAG_WHOAMI, size)
+            return (_TAG_WHOAMI, size)
 
         if tag == 13:
             code = size >> 16
@@ -361,18 +271,18 @@ class RespBuffer:
         if tag == 15: # request error
             code = size >> 16
             if code == 0:
-                return (TAG_ERROR, ERR_CODE_NXID)
+                return (_TAG_ERROR, _ERR_CODE_NXID)
             if code == 1:
-                return (TAG_ERROR, ERR_CODE_NXTYPE)
+                return (_TAG_ERROR, _ERR_CODE_NXTYPE)
             if code == 2:
-                return (TAG_ERROR, ERR_CODE_CHECKSUM)
+                return (_TAG_ERROR, _ERR_CODE_CHECKSUM)
             if code == 3:
-                return (TAG_ERROR, ERR_CODE_HAS_TOKENS)
+                return (_TAG_ERROR, _ERR_CODE_HAS_TOKENS)
             if code == 4:
                 # number of errors is encoded at byte boundary, so let's just
                 # go back a little
                 self.pos = 2
-                return (TAG_ERROR, ERR_CODE_SCHEMA)
+                return (_TAG_ERROR, _ERR_CODE_SCHEMA)
             raise ProtocolError("unrecognized request error code: %d", code)
 
         raise ProtocolError("unrecognized reply tag: %s", tag)
@@ -428,12 +338,24 @@ class RespBuffer:
         return self.pos >= len(self.buf)
 
 # }}}
-#------------------------------------------------------
+#-----------------------------------------------------------------------------
 
-class GrailBagServer:
+class Artifact:
+    def __init__(self):
+        self.id = None
+        self.type = None
+        self.size = None
+        self.digest = None
+        self.ctime = None
+        self.mtime = None
+        self.tags = {}
+        self.tokens = []
+        self.valid = False # conforming to artifact's schema
+
+class Server:
 
     #------------------------------------------------------
-    # GrailBagServer.Download (context manager) {{{
+    # Server.Download (context manager) {{{
 
     class Download:
         def __init__(self, info, conn, size, parent):
@@ -479,7 +401,7 @@ class GrailBagServer:
 
     # }}}
     #------------------------------------------------------
-    # GrailBagServer.Upload (context manager) {{{
+    # Server.Upload (context manager) {{{
 
     class Upload:
         def __init__(self, chunk_size, id, conn, parent):
@@ -533,14 +455,14 @@ class GrailBagServer:
             reply = self._parent._recv()
             (tag, info) = reply.start_reading()
 
-            if tag is TAG_OK:
+            if tag is _TAG_OK:
                 artifact_id = reply.uuid()
 
                 if not reply.empty():
                     raise ProtocolError("unexpected message payload")
                 return
 
-            if tag is TAG_ERROR and info is ERR_CODE_CHECKSUM:
+            if tag is _TAG_ERROR and info is _ERR_CODE_CHECKSUM:
                 raise UploadChecksumMismatch(self.id)
 
             raise ProtocolError("unexpected reply (tag %s)", tag)
@@ -616,7 +538,7 @@ class GrailBagServer:
         return self._recv()
 
     def _recv(self):
-        sizebuf = RespBuffer(4)
+        sizebuf = _RespBuffer(4)
         while not sizebuf.full():
             buf = self.conn.recv(sizebuf.left())
             if buf == "":
@@ -624,7 +546,7 @@ class GrailBagServer:
                 raise ProtocolError("connection closed unexpectedly")
             sizebuf.add(buf)
 
-        data = RespBuffer(sizebuf.int32())
+        data = _RespBuffer(sizebuf.int32())
         while not data.full():
             buf = self.conn.recv(data.left())
             if buf == "":
@@ -636,7 +558,7 @@ class GrailBagServer:
 
     # }}}
     #------------------------------------------------------
-    # GrailBagServer._decode_schema_errors() {{{
+    # Server._decode_schema_errors() {{{
 
     @staticmethod
     def _decode_schema_errors(reply):
@@ -694,16 +616,16 @@ class GrailBagServer:
 
     def authenticate(self):
         if self.op_in_progress:
-            raise Exception("another GrailBagServer operation in progress")
+            raise Exception("another operation in progress")
 
-        request = ReqBuffer("l")
+        request = _ReqBuffer("l")
         request.add_str16(self.user)
         request.add_str16(self.password)
 
         reply = self._send(request)
         (tag, info) = reply.start_reading()
 
-        if tag is TAG_OK:
+        if tag is _TAG_OK:
             return
 
         # NOTE: authentication errors are raised in `reply.start_reading()'
@@ -712,14 +634,14 @@ class GrailBagServer:
 
     def whoami(self):
         if self.op_in_progress:
-            raise Exception("another GrailBagServer operation in progress")
+            raise Exception("another operation in progress")
 
-        request = ReqBuffer("w")
+        request = _ReqBuffer("w")
 
         reply = self._send(request)
         (tag, info) = reply.start_reading()
 
-        if tag is TAG_WHOAMI:
+        if tag is _TAG_WHOAMI:
             nperms = info
             user = reply.str16()
             if user == "":
@@ -744,9 +666,9 @@ class GrailBagServer:
 
     def store(self, artifact_type, tags):
         if self.op_in_progress:
-            raise Exception("another GrailBagServer operation in progress")
+            raise Exception("another operation in progress")
 
-        request = ReqBuffer("S")
+        request = _ReqBuffer("S")
         request.add_str16(artifact_type)
         request.add_int32(len(tags))
         for (name, value) in tags.iteritems():
@@ -755,20 +677,19 @@ class GrailBagServer:
         reply = self._send(request)
         (tag, info) = reply.start_reading()
 
-        if tag is TAG_OK_CHUNKSIZE:
+        if tag is _TAG_OK_CHUNKSIZE:
             chunk_size = info
             artifact_id = reply.uuid()
 
             if not reply.empty():
                 raise ProtocolError("unexpected message payload")
-            return GrailBagServer.Upload(chunk_size, str(artifact_id),
-                                         self.conn, self)
+            return Server.Upload(chunk_size, str(artifact_id), self.conn, self)
 
-        if tag is TAG_ERROR and info is ERR_CODE_NXTYPE:
+        if tag is _TAG_ERROR and info is _ERR_CODE_NXTYPE:
             raise UnknownType(artifact_type)
 
-        if tag is TAG_ERROR and info is ERR_CODE_SCHEMA:
-            error = GrailBagServer._decode_schema_errors(reply)
+        if tag is _TAG_ERROR and info is _ERR_CODE_SCHEMA:
+            error = Server._decode_schema_errors(reply)
             if not reply.empty():
                 raise ProtocolError("unexpected message payload")
             raise error
@@ -777,34 +698,36 @@ class GrailBagServer:
 
     def delete(self, artifact_id):
         if self.op_in_progress:
-            raise Exception("another GrailBagServer operation in progress")
+            raise Exception("another operation in progress")
+        artifact_id = uuid.UUID(artifact_id)
 
-        request = ReqBuffer("D")
+        request = _ReqBuffer("D")
         request.add(artifact_id.bytes)
 
         reply = self._send(request)
         (tag, info) = reply.start_reading()
 
-        if tag is TAG_OK:
+        if tag is _TAG_OK:
             artifact_id = reply.uuid()
 
             if not reply.empty():
                 raise ProtocolError("unexpected message payload")
             return True
 
-        if tag is TAG_ERROR and info is ERR_CODE_NXID:
+        if tag is _TAG_ERROR and info is _ERR_CODE_NXID:
             return False
 
-        if tag is TAG_ERROR and info is ERR_CODE_HAS_TOKENS:
+        if tag is _TAG_ERROR and info is _ERR_CODE_HAS_TOKENS:
             raise ArtifactHasTokens(artifact_id)
 
         raise ProtocolError("unexpected reply (tag %s)", tag)
 
     def update_tags(self, artifact_id, set_tags, unset_tags):
         if self.op_in_progress:
-            raise Exception("another GrailBagServer operation in progress")
+            raise Exception("another operation in progress")
+        artifact_id = uuid.UUID(artifact_id)
 
-        request = ReqBuffer("A")
+        request = _ReqBuffer("A")
         request.add(artifact_id.bytes)
         request.add_int32(len(set_tags))
         request.add_int32(len(unset_tags))
@@ -816,18 +739,18 @@ class GrailBagServer:
         reply = self._send(request)
         (tag, info) = reply.start_reading()
 
-        if tag is TAG_OK:
+        if tag is _TAG_OK:
             artifact_id = reply.uuid()
 
             if not reply.empty():
                 raise ProtocolError("unexpected message payload")
             return
 
-        if tag is TAG_ERROR and info is ERR_CODE_NXID:
+        if tag is _TAG_ERROR and info is _ERR_CODE_NXID:
             raise UnknownArtifact(artifact_id)
 
-        if tag is TAG_ERROR and info is ERR_CODE_SCHEMA:
-            error = GrailBagServer._decode_schema_errors(reply)
+        if tag is _TAG_ERROR and info is _ERR_CODE_SCHEMA:
+            error = Server._decode_schema_errors(reply)
             if not reply.empty():
                 raise ProtocolError("unexpected message payload")
             raise error
@@ -836,9 +759,10 @@ class GrailBagServer:
 
     def update_tokens(self, artifact_id, set_tokens, unset_tokens):
         if self.op_in_progress:
-            raise Exception("another GrailBagServer operation in progress")
+            raise Exception("another operation in progress")
+        artifact_id = uuid.UUID(artifact_id)
 
-        request = ReqBuffer("O")
+        request = _ReqBuffer("O")
         request.add(artifact_id.bytes)
         request.add_int32(len(set_tokens))
         request.add_int32(len(unset_tokens))
@@ -850,18 +774,18 @@ class GrailBagServer:
         reply = self._send(request)
         (tag, info) = reply.start_reading()
 
-        if tag is TAG_OK:
+        if tag is _TAG_OK:
             artifact_id = reply.uuid()
 
             if not reply.empty():
                 raise ProtocolError("unexpected message payload")
             return
 
-        if tag is TAG_ERROR and info is ERR_CODE_NXID:
+        if tag is _TAG_ERROR and info is _ERR_CODE_NXID:
             raise UnknownArtifact(artifact_id)
 
-        if tag is TAG_ERROR and info is ERR_CODE_SCHEMA:
-            error = GrailBagServer._decode_schema_errors(reply)
+        if tag is _TAG_ERROR and info is _ERR_CODE_SCHEMA:
+            error = Server._decode_schema_errors(reply)
             if not reply.empty():
                 raise ProtocolError("unexpected message payload")
             raise error
@@ -870,13 +794,13 @@ class GrailBagServer:
 
     def types(self):
         if self.op_in_progress:
-            raise Exception("another GrailBagServer operation in progress")
+            raise Exception("another operation in progress")
 
-        request = ReqBuffer("T")
+        request = _ReqBuffer("T")
         reply = self._send(request)
         (tag, info) = reply.start_reading()
 
-        if tag is TAG_TYPES:
+        if tag is _TAG_TYPES:
             ntypes = info
             result = [reply.str16() for i in xrange(ntypes)]
             if not reply.empty():
@@ -886,7 +810,7 @@ class GrailBagServer:
         raise ProtocolError("unexpected reply (tag %s)", tag)
 
     #------------------------------------------------------
-    # GrailBagServer._decode_artifact_info() {{{
+    # Server._decode_artifact_info() {{{
 
     @staticmethod
     def _decode_artifact_info(reply):
@@ -915,29 +839,29 @@ class GrailBagServer:
 
     def artifacts(self, artifact_type):
         if self.op_in_progress:
-            raise Exception("another GrailBagServer operation in progress")
+            raise Exception("another operation in progress")
 
-        request = ReqBuffer("L")
+        request = _ReqBuffer("L")
         request.add_str16(artifact_type)
 
         reply = self._send(request)
         (tag, info) = reply.start_reading()
 
-        if tag is TAG_LIST:
+        if tag is _TAG_LIST:
             nartifacts = info
             result = [
-                GrailBagServer._decode_artifact_info(reply)
+                Server._decode_artifact_info(reply)
                 for i in xrange(nartifacts)
             ]
             if not reply.empty():
                 raise ProtocolError("unexpected message payload")
             return result
 
-        if tag is TAG_ERROR and info is ERR_CODE_NXTYPE:
+        if tag is _TAG_ERROR and info is _ERR_CODE_NXTYPE:
             raise UnknownType(artifact_type)
 
-        if tag is TAG_ERROR and info is ERR_CODE_SCHEMA:
-            error = GrailBagServer._decode_schema_errors(reply)
+        if tag is _TAG_ERROR and info is _ERR_CODE_SCHEMA:
+            error = Server._decode_schema_errors(reply)
             if not reply.empty():
                 raise ProtocolError("unexpected message payload")
             raise error
@@ -946,21 +870,22 @@ class GrailBagServer:
 
     def info(self, artifact_id):
         if self.op_in_progress:
-            raise Exception("another GrailBagServer operation in progress")
+            raise Exception("another operation in progress")
+        artifact_id = uuid.UUID(artifact_id)
 
-        request = ReqBuffer("I")
+        request = _ReqBuffer("I")
         request.add(artifact_id.bytes)
 
         reply = self._send(request)
         (tag, info) = reply.start_reading()
 
-        if tag is TAG_INFO:
-            result = GrailBagServer._decode_artifact_info(reply)
+        if tag is _TAG_INFO:
+            result = Server._decode_artifact_info(reply)
             if not reply.empty():
                 raise ProtocolError("unexpected message payload")
             return result
 
-        if tag is TAG_ERROR and info is ERR_CODE_NXID:
+        if tag is _TAG_ERROR and info is _ERR_CODE_NXID:
             raise UnknownArtifact(artifact_id)
 
         raise ProtocolError("unexpected reply (tag %s)", tag)
@@ -968,328 +893,26 @@ class GrailBagServer:
     def get(self, artifact_id):
         # returns a context manager
         if self.op_in_progress:
-            raise Exception("another GrailBagServer operation in progress")
+            raise Exception("another operation in progress")
+        artifact_id = uuid.UUID(artifact_id)
 
-        request = ReqBuffer("G")
+        request = _ReqBuffer("G")
         request.add(artifact_id.bytes)
 
         reply = self._send(request)
         (tag, info) = reply.start_reading()
 
-        if tag is TAG_INFO:
-            info = GrailBagServer._decode_artifact_info(reply)
+        if tag is _TAG_INFO:
+            info = Server._decode_artifact_info(reply)
             if not reply.empty():
                 self._close()
                 raise ProtocolError("unexpected message payload")
-            return GrailBagServer.Download(info, self.conn, info.size, self)
+            return Server.Download(info, self.conn, info.size, self)
 
-        if tag is TAG_ERROR and info is ERR_CODE_NXID:
+        if tag is _TAG_ERROR and info is _ERR_CODE_NXID:
             raise UnknownArtifact(artifact_id)
 
         raise ProtocolError("unexpected reply (tag %s)", tag)
-
-# }}}
-#-----------------------------------------------------------------------------
-# operations {{{
-
-#------------------------------------------------------
-# yaml_string() {{{
-
-_ALNUM = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789")
-def yaml_string(data):
-    if len(set(data) - _ALNUM) > 0 or \
-       (len(data) > 0 and data[0] in "0123456789") or \
-       data in ["true", "false", "null"]:
-        return json.dumps(data)
-    else:
-        return data
-
-# }}}
-#------------------------------------------------------
-# format_artifact_info() {{{
-
-def format_artifact_info(info):
-    result = (
-        '{id}:\n'
-        '  type: {type}\n'
-        '  valid: {valid}\n'
-        '  size: {size}\n'
-        '  sha512: "{hash}"\n'
-        '  ctime: "{ctime}"\n'
-        '  mtime: "{mtime}"\n'
-    ).format(
-        id = yaml_string(info.id),
-        type = yaml_string(info.type),
-        valid = ("true" if info.valid else "false"),
-        size = info.size,
-        hash = info.digest.encode("hex"),
-        ctime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(info.ctime)),
-        mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(info.mtime)),
-    )
-    if len(info.tags) == 0:
-        result += "  tags: {}\n"
-    else:
-        result += "  tags:\n"
-        result += "".join(
-            '    %s: %s\n' % (yaml_string(n), yaml_string(info.tags[n]))
-            for n in sorted(info.tags)
-        )
-    result += "  tokens: %s\n" % (json.dumps(sorted(info.tokens)),)
-    return result.rstrip("\n")
-
-# }}}
-#------------------------------------------------------
-
-#------------------------------------------------------
-# WHOAMI {{{
-
-def op_whoami(server):
-    (user, permissions) = server.whoami()
-    if user is None:
-        return
-
-    print "user: %s" % (yaml_string(user),)
-    if len(permissions) == 0:
-        print "permissions: {}"
-    else:
-        print "permissions:"
-        if "*" in permissions:
-            print '  "*": [%s]' % (", ".join(permissions["*"]),)
-            del permissions["*"]
-        for artifact_type in sorted(permissions):
-            perms = permissions[artifact_type]
-            print "  %s: [%s]" % (yaml_string(artifact_type), ", ".join(perms))
-
-# }}}
-#------------------------------------------------------
-# STORE type filename [tags ...] {{{
-
-def op_store(server, artifact_type, filename, *tags):
-    set_tags = dict(t.split("=") for t in tags if "=" in t)
-    source = open(filename, "r") if filename != "-" else sys.stdin
-    with source:
-        with server.store(artifact_type, set_tags) as upload:
-            print "id: %s" % (yaml_string(upload.id),)
-            # NOTE: `upload.chunk_size' is guaranteed to be >=4096 bytes
-            chunk_size = 4096
-            chunk = source.read(chunk_size)
-            while chunk != "":
-                upload.write(chunk)
-                chunk = source.read(chunk_size)
-            upload.done()
-            print "# uploaded"
-
-# }}}
-#------------------------------------------------------
-# DELETE id {{{
-
-def op_delete(server, artifact_id):
-    server.delete(uuid.UUID(artifact_id))
-    print "deleted"
-
-# }}}
-#------------------------------------------------------
-# TAGS id tags ... {{{
-
-def op_tags(server, artifact_id, *tags):
-    set_tags = dict(t.split("=") for t in tags if "=" in t)
-    unset_tags = [t[1:] for t in tags if t.startswith("-")]
-    server.update_tags(uuid.UUID(artifact_id), set_tags, unset_tags)
-    print "tags updated"
-
-# }}}
-#------------------------------------------------------
-# TOKENS id tokens ... {{{
-
-def op_tokens(server, artifact_id, *tokens):
-    set_tokens = [t[1:] for t in tokens if t.startswith("+")]
-    unset_tokens = [t[1:] for t in tokens if t.startswith("-")]
-    server.update_tokens(uuid.UUID(artifact_id), set_tokens, unset_tokens)
-    print "tokens updated"
-
-# }}}
-#------------------------------------------------------
-# LIST [type ...] {{{
-
-def op_list(server, *artifact_types):
-    if len(artifact_types) == 0:
-        types = server.types()
-        if len(types) == 0:
-            print "# no known artifact types"
-            print "--- []"
-        else:
-            print "# known artifact types"
-            for t in types:
-                print "- " + yaml_string(t)
-        return
-
-    printed_artifacts = 0
-    for atype in artifact_types:
-        artifacts = server.artifacts(atype)
-        printed_artifacts += len(artifacts)
-        for a in artifacts:
-            print format_artifact_info(a)
-
-    if printed_artifacts == 0:
-        print "# no artifacts"
-        print "--- {}"
-
-# }}}
-#------------------------------------------------------
-# INFO id {{{
-
-def op_info(server, artifact_id):
-    info = server.info(uuid.UUID(artifact_id))
-    print format_artifact_info(info)
-
-# }}}
-#------------------------------------------------------
-# GET id filename {{{
-
-def op_get(server, artifact_id, filename):
-    with server.get(uuid.UUID(artifact_id)) as download:
-        ctx = hashlib.sha512()
-        with open(filename, "w") as output:
-            for chunk in download.chunks(4096):
-                ctx.update(chunk)
-                output.write(chunk)
-        digest = ctx.digest()
-        if digest != download.info.digest:
-            # TODO: react somehow (call `os.unlink(filename)'?)
-            print >>sys.stderr, "digest mismatch!"
-            return 1
-        print format_artifact_info(download.info)
-
-# }}}
-#------------------------------------------------------
-# WATCH type {{{
-
-class ArtifactState:
-    def __init__(self, artifacts):
-        self.artifacts = {}
-        self.tokens = {}
-        for a in artifacts:
-            self.artifacts[a.id] = a
-            for t in a.tokens:
-                self.tokens[t] = a.id
-        self.ids = set(self.artifacts)
-
-def op_watch(server, artifact_type):
-    state = ArtifactState(server.artifacts(artifact_type))
-    # TODO: dump the current state
-    while True:
-        time.sleep(options.interval)
-        old_state = state
-        state = ArtifactState(server.artifacts(artifact_type))
-
-        changes = []
-        # print deleted tokens before any deleted artifacts
-        for token in sorted(old_state.tokens):
-            if token in state.tokens:
-                continue
-            changes.append({
-                "token": token,
-                "old": old_state.tokens[token],
-                "new": None,
-            })
-
-        for aid in old_state.ids - state.ids:
-            changes.append({
-                "state": "deleted",
-                "artifact": aid,
-                #"tags": None,
-            })
-
-        for aid in state.ids - old_state.ids:
-            changes.append({
-                "state": "added",
-                "artifact": aid,
-                "tags": state.artifacts[aid].tags,
-            })
-
-        for aid in old_state.ids & state.ids:
-            old_tags = old_state.artifacts[aid].tags
-            new_tags = state.artifacts[aid].tags
-            token_changes = {
-                tag: new_tags.get(tag)
-                for tag in set(old_tags) | set(new_tags)
-                if old_tags.get(tag) != new_tags.get(tag)
-            }
-            if len(token_changes) > 0:
-                changes.append({
-                    "state": "changed",
-                    "artifact": aid,
-                    "tags": token_changes,
-                })
-
-        # new tokens and moved tokens (deleted ones were printed earlier)
-        for token in sorted(state.tokens):
-            old_id = old_state.tokens.get(token)
-            new_id = state.tokens[token]
-            if old_id != new_id:
-                changes.append({
-                    "token": token,
-                    "old": old_id,
-                    "new": new_id,
-                })
-
-        if len(changes) > 0:
-            now = int(time.time())
-            for m in changes:
-                m["time"] = now
-                sys.stdout.write(json.dumps(m, sort_keys = True))
-                sys.stdout.write("\n")
-            sys.stdout.flush()
-
-# }}}
-#------------------------------------------------------
-
-OPERATIONS = {
-    "whoami": {"op": op_whoami, "nargs": lambda n: n == 0},
-    "store":  {"op": op_store,  "nargs": lambda n: n >= 2},
-    "delete": {"op": op_delete, "nargs": lambda n: n == 1},
-    "tags":   {"op": op_tags,   "nargs": lambda n: n >= 2},
-    "tokens": {"op": op_tokens, "nargs": lambda n: n >= 2},
-    "list":   {"op": op_list,   "nargs": lambda n: n >= 0},
-    "info":   {"op": op_info,   "nargs": lambda n: n == 1},
-    "get":    {"op": op_get,    "nargs": lambda n: n == 2},
-    "watch":  {"op": op_watch,  "nargs": lambda n: n == 1},
-}
-
-# }}}
-#-----------------------------------------------------------------------------
-
-if operation not in OPERATIONS:
-    parser.error('unknown operation "%s"' % (operation,))
-
-if not OPERATIONS[operation]["nargs"](len(args)):
-    parser.error('wrong number of arguments for "%s"' % (operation,))
-
-if ":" in options.server:
-    (host, port) = options.server.split(":")
-    port = int(port)
-    server = GrailBagServer(
-        host = host, port = port,
-        user = options.user, password = options.password,
-        ca_file = options.ca_file,
-    )
-else:
-    server = GrailBagServer(
-        host = options.server,
-        user = options.user, password = options.password,
-        ca_file = options.ca_file
-    )
-
-try:
-    ret = OPERATIONS[operation]["op"](server, *args)
-except GrailBagException as e:
-    print >>sys.stderr, str(e)
-    sys.exit(255)
-except KeyboardInterrupt:
-    sys.exit(0)
-
-if isinstance(ret, (int, long)):
-    sys.exit(ret)
 
 #-----------------------------------------------------------------------------
 # vim:ft=python:foldmethod=marker

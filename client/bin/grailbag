@@ -1,0 +1,377 @@
+#!/usr/bin/python
+
+import optparse
+import getpass
+import sys
+import grailbag
+import time
+import hashlib
+import json
+
+#-----------------------------------------------------------------------------
+# command line options {{{
+
+parser = optparse.OptionParser(
+    usage = \
+        "\n  %prog store  <type> <filename> [tags ...]" \
+        "\n  %prog delete <id>" \
+        "\n  %prog tags   <id> -- [tags ...]" \
+        "\n  %prog tokens <id> -- [tokens ...]" \
+        "\n  %prog list" \
+        "\n  %prog list <type> [<type> ...]" \
+        "\n  %prog info <id>" \
+        "\n  %prog get  <id> <filename>" \
+        "\n  %prog whoami"
+)
+
+# TODO: remove this option once WATCH is implemented server-side
+parser.add_option(
+    "--interval", dest = "interval", type = "int",
+    default = 5,
+    help = "watch interval", metavar = "SECONDS",
+)
+
+parser.add_option(
+    "--user", dest = "user",
+    help = "authentication user name", metavar = "USER",
+)
+parser.add_option(
+    "--password-fd", dest = "passwd_source", type = "int",
+    help = "file descriptor to read password from", metavar = "NUM",
+)
+parser.add_option(
+    "--password-file", dest = "passwd_source",
+    help = "file to read password from", metavar = "PATH",
+)
+parser.add_option(
+    "--server", dest = "server",
+    default = "localhost:3255",
+    help = "server address", metavar = "ADDR",
+)
+parser.add_option(
+    "--ca-file", dest = "ca_file",
+    help = "CA certificate to verify against", metavar = "PATH",
+)
+
+(options, args) = parser.parse_args()
+if len(args) == 0:
+    parser.print_help()
+    sys.exit()
+
+operation = args[0]
+del args[0]
+
+if options.user is None:
+    options.user = getpass.getuser()
+
+try:
+    if isinstance(options.passwd_source, (int, long)):
+        with os.fdopen(options.passwd_source, 'r') as passfile:
+            options.password = passfile.readline().rstrip("\n")
+    elif isinstance(options.passwd_source, (str, unicode)):
+        with open(options.passwd_source) as passfile:
+            options.password = passfile.readline().rstrip("\n")
+    else: # options.passwd_source is None:
+        options.password = \
+            getpass.getpass("password for %s: " % (options.user,))
+except KeyboardInterrupt:
+    sys.exit()
+
+# }}}
+#-----------------------------------------------------------------------------
+# output formatting helpers {{{
+
+_ALNUM = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789")
+def yaml_string(data):
+    if len(set(data) - _ALNUM) > 0 or \
+       (len(data) > 0 and data[0] in "0123456789") or \
+       data in ["true", "false", "null"]:
+        return json.dumps(data)
+    else:
+        return data
+
+def format_artifact_info(info):
+    result = (
+        '{id}:\n'
+        '  type: {type}\n'
+        '  valid: {valid}\n'
+        '  size: {size}\n'
+        '  sha512: "{hash}"\n'
+        '  ctime: "{ctime}"\n'
+        '  mtime: "{mtime}"\n'
+    ).format(
+        id = yaml_string(info.id),
+        type = yaml_string(info.type),
+        valid = ("true" if info.valid else "false"),
+        size = info.size,
+        hash = info.digest.encode("hex"),
+        ctime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(info.ctime)),
+        mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(info.mtime)),
+    )
+    if len(info.tags) == 0:
+        result += "  tags: {}\n"
+    else:
+        result += "  tags:\n"
+        result += "".join(
+            '    %s: %s\n' % (yaml_string(n), yaml_string(info.tags[n]))
+            for n in sorted(info.tags)
+        )
+    result += "  tokens: %s\n" % (json.dumps(sorted(info.tokens)),)
+    return result.rstrip("\n")
+
+# }}}
+#-----------------------------------------------------------------------------
+# operations
+
+#------------------------------------------------------
+# WHOAMI {{{
+
+def op_whoami(server):
+    (user, permissions) = server.whoami()
+    if user is None:
+        return
+
+    print "user: %s" % (yaml_string(user),)
+    if len(permissions) == 0:
+        print "permissions: {}"
+    else:
+        print "permissions:"
+        if "*" in permissions:
+            print '  "*": [%s]' % (", ".join(permissions["*"]),)
+            del permissions["*"]
+        for artifact_type in sorted(permissions):
+            perms = permissions[artifact_type]
+            print "  %s: [%s]" % (yaml_string(artifact_type), ", ".join(perms))
+
+# }}}
+#------------------------------------------------------
+# STORE type filename [tags ...] {{{
+
+def op_store(server, artifact_type, filename, *tags):
+    set_tags = dict(t.split("=") for t in tags if "=" in t)
+    source = open(filename, "r") if filename != "-" else sys.stdin
+    with source:
+        with server.store(artifact_type, set_tags) as upload:
+            print "id: %s" % (yaml_string(upload.id),)
+            # NOTE: `upload.chunk_size' is guaranteed to be >=4096 bytes
+            chunk_size = 4096
+            chunk = source.read(chunk_size)
+            while chunk != "":
+                upload.write(chunk)
+                chunk = source.read(chunk_size)
+            upload.done()
+            print "# uploaded"
+
+# }}}
+#------------------------------------------------------
+# DELETE id {{{
+
+def op_delete(server, artifact_id):
+    server.delete(artifact_id)
+    print "deleted"
+
+# }}}
+#------------------------------------------------------
+# TAGS id tags ... {{{
+
+def op_tags(server, artifact_id, *tags):
+    set_tags = dict(t.split("=") for t in tags if "=" in t)
+    unset_tags = [t[1:] for t in tags if t.startswith("-")]
+    server.update_tags(artifact_id, set_tags, unset_tags)
+    print "tags updated"
+
+# }}}
+#------------------------------------------------------
+# TOKENS id tokens ... {{{
+
+def op_tokens(server, artifact_id, *tokens):
+    set_tokens = [t[1:] for t in tokens if t.startswith("+")]
+    unset_tokens = [t[1:] for t in tokens if t.startswith("-")]
+    server.update_tokens(artifact_id, set_tokens, unset_tokens)
+    print "tokens updated"
+
+# }}}
+#------------------------------------------------------
+# LIST [type ...] {{{
+
+def op_list(server, *artifact_types):
+    if len(artifact_types) == 0:
+        types = server.types()
+        if len(types) == 0:
+            print "# no known artifact types"
+            print "--- []"
+        else:
+            print "# known artifact types"
+            for t in types:
+                print "- " + yaml_string(t)
+        return
+
+    printed_artifacts = 0
+    for atype in artifact_types:
+        artifacts = server.artifacts(atype)
+        printed_artifacts += len(artifacts)
+        for a in artifacts:
+            print format_artifact_info(a)
+
+    if printed_artifacts == 0:
+        print "# no artifacts"
+        print "--- {}"
+
+# }}}
+#------------------------------------------------------
+# INFO id {{{
+
+def op_info(server, artifact_id):
+    info = server.info(artifact_id)
+    print format_artifact_info(info)
+
+# }}}
+#------------------------------------------------------
+# GET id filename {{{
+
+def op_get(server, artifact_id, filename):
+    with server.get(artifact_id) as download:
+        ctx = hashlib.sha512()
+        with open(filename, "w") as output:
+            for chunk in download.chunks(4096):
+                ctx.update(chunk)
+                output.write(chunk)
+        digest = ctx.digest()
+        if digest != download.info.digest:
+            # TODO: react somehow (call `os.unlink(filename)'?)
+            print >>sys.stderr, "digest mismatch!"
+            return 1
+        print format_artifact_info(download.info)
+
+# }}}
+#------------------------------------------------------
+# WATCH type {{{
+
+class ArtifactState:
+    def __init__(self, artifacts):
+        self.artifacts = {}
+        self.tokens = {}
+        for a in artifacts:
+            self.artifacts[a.id] = a
+            for t in a.tokens:
+                self.tokens[t] = a.id
+        self.ids = set(self.artifacts)
+
+def op_watch(server, artifact_type):
+    state = ArtifactState(server.artifacts(artifact_type))
+    # TODO: dump the current state
+    while True:
+        time.sleep(options.interval)
+        old_state = state
+        state = ArtifactState(server.artifacts(artifact_type))
+
+        changes = []
+        # print deleted tokens before any deleted artifacts
+        for token in sorted(old_state.tokens):
+            if token in state.tokens:
+                continue
+            changes.append({
+                "token": token,
+                "old": old_state.tokens[token],
+                "new": None,
+            })
+
+        for aid in old_state.ids - state.ids:
+            changes.append({
+                "state": "deleted",
+                "artifact": aid,
+                #"tags": None,
+            })
+
+        for aid in state.ids - old_state.ids:
+            changes.append({
+                "state": "added",
+                "artifact": aid,
+                "tags": state.artifacts[aid].tags,
+            })
+
+        for aid in old_state.ids & state.ids:
+            old_tags = old_state.artifacts[aid].tags
+            new_tags = state.artifacts[aid].tags
+            token_changes = {
+                tag: new_tags.get(tag)
+                for tag in set(old_tags) | set(new_tags)
+                if old_tags.get(tag) != new_tags.get(tag)
+            }
+            if len(token_changes) > 0:
+                changes.append({
+                    "state": "changed",
+                    "artifact": aid,
+                    "tags": token_changes,
+                })
+
+        # new tokens and moved tokens (deleted ones were printed earlier)
+        for token in sorted(state.tokens):
+            old_id = old_state.tokens.get(token)
+            new_id = state.tokens[token]
+            if old_id != new_id:
+                changes.append({
+                    "token": token,
+                    "old": old_id,
+                    "new": new_id,
+                })
+
+        if len(changes) > 0:
+            now = int(time.time())
+            for m in changes:
+                m["time"] = now
+                sys.stdout.write(json.dumps(m, sort_keys = True))
+                sys.stdout.write("\n")
+            sys.stdout.flush()
+
+# }}}
+#------------------------------------------------------
+
+OPERATIONS = {
+    "whoami": {"op": op_whoami, "nargs": lambda n: n == 0},
+    "store":  {"op": op_store,  "nargs": lambda n: n >= 2},
+    "delete": {"op": op_delete, "nargs": lambda n: n == 1},
+    "tags":   {"op": op_tags,   "nargs": lambda n: n >= 2},
+    "tokens": {"op": op_tokens, "nargs": lambda n: n >= 2},
+    "list":   {"op": op_list,   "nargs": lambda n: n >= 0},
+    "info":   {"op": op_info,   "nargs": lambda n: n == 1},
+    "get":    {"op": op_get,    "nargs": lambda n: n == 2},
+    "watch":  {"op": op_watch,  "nargs": lambda n: n == 1},
+}
+
+#-----------------------------------------------------------------------------
+
+if operation not in OPERATIONS:
+    parser.error('unknown operation "%s"' % (operation,))
+
+if not OPERATIONS[operation]["nargs"](len(args)):
+    parser.error('wrong number of arguments for "%s"' % (operation,))
+
+if ":" in options.server:
+    (host, port) = options.server.split(":")
+    port = int(port)
+    server = grailbag.Server(
+        host = host, port = port,
+        user = options.user, password = options.password,
+        ca_file = options.ca_file,
+    )
+else:
+    server = grailbag.Server(
+        host = options.server,
+        user = options.user, password = options.password,
+        ca_file = options.ca_file
+    )
+
+try:
+    ret = OPERATIONS[operation]["op"](server, *args)
+except grailbag.GrailBagException as e:
+    print >>sys.stderr, str(e)
+    sys.exit(255)
+except KeyboardInterrupt:
+    sys.exit(0)
+
+if isinstance(ret, (int, long)):
+    sys.exit(ret)
+
+#-----------------------------------------------------------------------------
+# vim:ft=python:foldmethod=marker
