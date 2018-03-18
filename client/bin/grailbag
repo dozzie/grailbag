@@ -61,22 +61,6 @@ if len(args) == 0:
 operation = args[0]
 del args[0]
 
-if options.user is None:
-    options.user = getpass.getuser()
-
-try:
-    if isinstance(options.passwd_source, (int, long)):
-        with os.fdopen(options.passwd_source, 'r') as passfile:
-            options.password = passfile.readline().rstrip("\n")
-    elif isinstance(options.passwd_source, (str, unicode)):
-        with open(options.passwd_source) as passfile:
-            options.password = passfile.readline().rstrip("\n")
-    else: # options.passwd_source is None:
-        options.password = \
-            getpass.getpass("password for %s: " % (options.user,))
-except KeyboardInterrupt:
-    sys.exit()
-
 # }}}
 #-----------------------------------------------------------------------------
 # output formatting helpers {{{
@@ -346,6 +330,22 @@ if operation not in OPERATIONS:
 
 if not OPERATIONS[operation]["nargs"](len(args)):
     parser.error('wrong number of arguments for "%s"' % (operation,))
+
+if options.user is None:
+    options.user = getpass.getuser()
+
+try:
+    if isinstance(options.passwd_source, (int, long)):
+        with os.fdopen(options.passwd_source, 'r') as passfile:
+            options.password = passfile.readline().rstrip("\n")
+    elif isinstance(options.passwd_source, (str, unicode)):
+        with open(options.passwd_source) as passfile:
+            options.password = passfile.readline().rstrip("\n")
+    else: # options.passwd_source is None:
+        options.password = \
+            getpass.getpass("password for %s: " % (options.user,))
+except KeyboardInterrupt:
+    sys.exit()
 
 if ":" in options.server:
     (host, port) = options.server.split(":")
