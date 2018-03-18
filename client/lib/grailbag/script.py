@@ -6,6 +6,8 @@ import os
 import shutil
 import stat
 import errno
+import fnmatch
+import collections
 from artifact import Artifact
 from exceptions import *
 
@@ -117,6 +119,115 @@ class _Plan:
 
         for (action, log, error) in self._plan:
             yield (action[0], action[1:], log)
+
+# }}}
+#-----------------------------------------------------------------------------
+# glob mapping {{{
+
+class GlobMap:
+    def __init__(self):
+        self._rules = collections.deque()
+
+    @staticmethod
+    def _split(path):
+        return [f for f in path.split("/") if f != "" and f != "."]
+
+    def add(self, pattern, include = True):
+        fragments = GlobMap._split(pattern)
+        self._rules.appendleft((include, fragments))
+
+    @staticmethod
+    def _match(path, rule):
+        i = 0
+        while i < len(path) and i < len(rule):
+            if not fnmatch.fnmatch(path[i], rule[i]):
+                return None
+            i += 1
+        return (path[i:], rule[i:])
+
+    def _file_match(self, path):
+        path_frags = GlobMap._split(path)
+
+        for (include, rule_frags) in self._rules:
+            match = GlobMap._match(path_frags, rule_frags)
+            if match is not None and len(match[1]) == 0:
+                # rule pattern exhausted
+                return include
+
+        # default decision
+        return False
+
+    def _dir_match(self, path):
+        path_frags = GlobMap._split(path)
+
+        path_include = None
+        subtree_decisions = set()
+        for (include, rule_frags) in self._rules:
+            match = GlobMap._match(path_frags, rule_frags)
+            if match is None:
+                continue
+            if path_include is None and len(match[1]) == 0:
+                # rule pattern exhausted for the first time
+                path_include = include
+            elif len(match[0]) == 0 and len(match[1]) > 0:
+                # path exhausted, so it's a pattern from the subtree
+                subtree_decisions.add(include)
+
+        if path_include is None:
+            # default decision
+            path_include = False
+
+        # the decision for the whole subtree is definitive ("skip/recurse
+        # whole subtree") if the other decision is present somewhere in the
+        # subtree
+        definitive = ((not path_include) not in subtree_decisions)
+        return (path_include, definitive)
+
+    def dirtree(self, rootdir):
+        paths = []
+        subtrees = []
+        def walk(subdir):
+            for name in sorted(os.listdir(os.path.join(rootdir, subdir))):
+                path = os.path.join(subdir, name)
+                ftype = _file_type(os.path.join(rootdir, path))
+
+                if ftype != stat.S_IFDIR:
+                    if self._file_match(path):
+                        paths.append(path)
+                    continue
+
+                # XXX: subdirectory
+                (include, whole_subtree) = self._dir_match(path)
+                if whole_subtree:
+                    if include:
+                        subtrees.append(path)
+                    continue
+
+                if include:
+                    paths.append(path)
+
+                walk(path)
+
+        for path in sorted(os.listdir(rootdir)):
+            ftype = _file_type(os.path.join(rootdir, path))
+
+            if ftype != stat.S_IFDIR:
+                if self._file_match(path):
+                    paths.append(path)
+                continue
+
+            # XXX: subdirectory
+            (include, whole_subtree) = self._dir_match(path)
+            if whole_subtree:
+                if include:
+                    subtrees.append(path)
+                continue
+
+            if include:
+                paths.append(path)
+
+            walk(path)
+        return (paths, subtrees)
 
 # }}}
 #-----------------------------------------------------------------------------
@@ -362,6 +473,7 @@ class _OpRunScript:
 
 class Script:
     def __init__(self, script = None):
+        self._globs = GlobMap()
         self._watch = []
         self._ops = []
         self._env = {}
@@ -373,11 +485,17 @@ class Script:
     # script builder {{{
 
     def watch(self, wildcard):
-        self._watch.append(_OpWatch(_format(wildcard, None, {}, self._env)))
+        # XXX: the last entry has the precedence
+        pattern = _format(wildcard, None, {}, self._env)
+        self._watch.append(_OpWatch(pattern))
+        self._globs.add(pattern, include = True)
         return True
 
     def ignore(self, wildcard):
-        self._watch.append(_OpIgnore(_format(wildcard, None, {}, self._env)))
+        # XXX: the last entry has the precedence
+        pattern = _format(wildcard, None, {}, self._env)
+        self._watch.append(_OpIgnore(pattern))
+        self._globs.add(pattern, include = False)
         return True
 
     def file(self, format, artifact, **tags):
@@ -485,7 +603,72 @@ class Script:
             if not dry_run:
                 fun(*args)
 
-        # TODO: clean up the rootdir, according to self._watch
+        if handle is not None:
+            handle.write("## cleanup\n")
+            handle.flush()
+
+        # things to check if they were created by this run
+        (paths, subtrees) = self._globs.dirtree(rootdir)
+        deleted = set()
+        for path in sorted(paths, reverse = True):
+            if path in plan:
+                continue
+            if handle is not None:
+                handle.write("delete %s\n" % (_quote(path),))
+            if not dry_run:
+                full_path = os.path.join(rootdir, path)
+                ftype = _file_type(full_path)
+                if ftype == stat.S_IFDIR:
+                    try:
+                        os.rmdir(full_path)
+                    except OSError, e:
+                        if e.errno == errno.ENOTEMPTY:
+                            continue
+                        raise
+                elif ftype is not None:
+                    os.unlink(full_path)
+        if handle is not None:
+            handle.flush()
+
+        def strip_rootdir(path):
+            if len(path) > len(rootdir) and path.startswith(rootdir) and \
+               path[len(rootdir)] == "/":
+                return path[(len(rootdir) + 1):]
+            return path
+
+        for tree in subtrees:
+            tree_path = os.path.join(rootdir, tree)
+            for (d, dirs, files) in os.walk(tree_path, topdown = False):
+                drel = strip_rootdir(d)
+
+                for name in dirs:
+                    path = os.path.join(drel, name)
+                    if path in plan:
+                        continue
+                    if handle is not None:
+                        handle.write("delete %s\n" % (_quote(path),))
+                    if not dry_run:
+                        # the directory should be empty (its children deleted
+                        # because of depth-first walk); if it contained any
+                        # files from the plan, it should be in the plan
+                        # itself, so we wouldn't get here
+                        os.rmdir(os.path.join(rootdir, path))
+
+                for name in files:
+                    path = os.path.join(drel, name)
+                    if path in plan:
+                        continue
+                    if handle is not None:
+                        handle.write("delete %s\n" % (_quote(path),))
+                    if not dry_run:
+                        os.unlink(os.path.join(rootdir, path))
+
+            if tree not in plan:
+                if handle is not None:
+                    handle.write("delete %s\n" % (_quote(tree),))
+                    handle.flush()
+                if not dry_run:
+                    os.rmdir(os.path.join(rootdir, tree_path))
 
     # }}}
     #-------------------------------------------------------
