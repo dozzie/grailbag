@@ -8,6 +8,8 @@ import os
 import uuid
 import hashlib
 
+from artifact import Artifact
+
 __all__ = [
     "GrailBagException",
     "AuthenticationError", "PermissionError",
@@ -341,18 +343,6 @@ class _RespBuffer:
 
 # }}}
 #-----------------------------------------------------------------------------
-
-class Artifact:
-    def __init__(self):
-        self.id = None
-        self.type = None
-        self.size = None
-        self.digest = None
-        self.ctime = None
-        self.mtime = None
-        self.tags = {}
-        self.tokens = []
-        self.valid = False # conforming to artifact's schema
 
 class Server:
 
