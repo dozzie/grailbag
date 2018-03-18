@@ -209,6 +209,8 @@ _TAG_WHOAMI = _Constant("WHOAMI")
 _TAG_TYPES = _Constant("TYPES")
 _TAG_ERROR = _Constant("ERROR")
 _TAG_SERVER_ERROR = _Constant("SERVER_ERROR")
+_TAG_AUTH_ERROR = _Constant("AUTH_ERROR")
+_TAG_PERMISSION_ERROR = _Constant("PERMISSION_ERROR")
 
 _ERR_CODE_NXID = _Constant("UNKNOWN_ARTIFACT")
 _ERR_CODE_NXTYPE = _Constant("UNKNOWN_ARTIFACT_TYPE")
@@ -259,9 +261,9 @@ class _RespBuffer:
         if tag == 13:
             code = size >> 16
             if code == 0:
-                raise AuthenticationError()
+                return (_TAG_AUTH_ERROR, None)
             elif code == 1:
-                raise PermissionError()
+                return (_TAG_PERMISSION_ERROR, None)
             raise ProtocolError("unrecognized request error code: %d", code)
 
         if tag == 14: # server error
@@ -509,7 +511,21 @@ class Server:
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 9)
 
         self.conn = conn
-        self.authenticate()
+
+        # authenticate
+        request = _ReqBuffer("l")
+        request.add_str16(self.user)
+        request.add_str16(self.password)
+
+        reply = self._send(request)
+        (tag, info) = reply.start_reading()
+        if tag is _TAG_OK:
+            return
+
+        if tag is _TAG_AUTH_ERROR:
+            raise AuthenticationError()
+
+        raise ProtocolError("unexpected reply (tag %s)", tag)
 
     def _close(self):
         if self.conn is not None:
@@ -614,24 +630,6 @@ class Server:
     # }}}
     #------------------------------------------------------
 
-    def authenticate(self):
-        if self.op_in_progress:
-            raise Exception("another operation in progress")
-
-        request = _ReqBuffer("l")
-        request.add_str16(self.user)
-        request.add_str16(self.password)
-
-        reply = self._send(request)
-        (tag, info) = reply.start_reading()
-
-        if tag is _TAG_OK:
-            return
-
-        # NOTE: authentication errors are raised in `reply.start_reading()'
-
-        raise ProtocolError("unexpected reply (tag %s)", tag)
-
     def whoami(self):
         if self.op_in_progress:
             raise Exception("another operation in progress")
@@ -663,7 +661,6 @@ class Server:
 
         raise ProtocolError("unexpected reply (tag %s)", tag)
 
-
     def store(self, artifact_type, tags):
         if self.op_in_progress:
             raise Exception("another operation in progress")
@@ -694,6 +691,9 @@ class Server:
                 raise ProtocolError("unexpected message payload")
             raise error
 
+        if tag is _TAG_PERMISSION_ERROR:
+            raise PermissionError()
+
         raise ProtocolError("unexpected reply (tag %s)", tag)
 
     def delete(self, artifact_id):
@@ -719,6 +719,9 @@ class Server:
 
         if tag is _TAG_ERROR and info is _ERR_CODE_HAS_TOKENS:
             raise ArtifactHasTokens(artifact_id)
+
+        if tag is _TAG_PERMISSION_ERROR:
+            raise PermissionError()
 
         raise ProtocolError("unexpected reply (tag %s)", tag)
 
@@ -755,6 +758,9 @@ class Server:
                 raise ProtocolError("unexpected message payload")
             raise error
 
+        if tag is _TAG_PERMISSION_ERROR:
+            raise PermissionError()
+
         raise ProtocolError("unexpected reply (tag %s)", tag)
 
     def update_tokens(self, artifact_id, set_tokens, unset_tokens):
@@ -789,6 +795,9 @@ class Server:
             if not reply.empty():
                 raise ProtocolError("unexpected message payload")
             raise error
+
+        if tag is _TAG_PERMISSION_ERROR:
+            raise PermissionError()
 
         raise ProtocolError("unexpected reply (tag %s)", tag)
 
@@ -866,6 +875,9 @@ class Server:
                 raise ProtocolError("unexpected message payload")
             raise error
 
+        if tag is _TAG_PERMISSION_ERROR:
+            raise PermissionError()
+
         raise ProtocolError("unexpected reply (tag %s)", tag)
 
     def info(self, artifact_id):
@@ -887,6 +899,9 @@ class Server:
 
         if tag is _TAG_ERROR and info is _ERR_CODE_NXID:
             raise UnknownArtifact(artifact_id)
+
+        if tag is _TAG_PERMISSION_ERROR:
+            raise PermissionError()
 
         raise ProtocolError("unexpected reply (tag %s)", tag)
 
@@ -911,6 +926,9 @@ class Server:
 
         if tag is _TAG_ERROR and info is _ERR_CODE_NXID:
             raise UnknownArtifact(artifact_id)
+
+        if tag is _TAG_PERMISSION_ERROR:
+            raise PermissionError()
 
         raise ProtocolError("unexpected reply (tag %s)", tag)
 
