@@ -2,6 +2,7 @@
 
 import re
 import hashlib
+import subprocess
 import os
 import shutil
 import stat
@@ -285,9 +286,28 @@ def _make_path(path):
 def _make_link(target, link):
     os.symlink(target, link)
 
-def _execute(command, args):
-    print "TODO: implement running commands"
-    pass # TODO: implement me
+def _execute(command, shell, env, rootdir):
+    def set_env():
+        for (key,value) in env.iteritems():
+            os.environ[key] = value
+
+    process = subprocess.Popen(
+        command,
+        stdin = subprocess.PIPE,
+        close_fds = True,
+        preexec_fn = set_env,
+        cwd = rootdir,
+        shell = shell,
+    )
+    process.communicate()
+    if process.returncode > 0:
+        # TODO: change the error type
+        raise Exception("command exited with code %d" % (process.returncode,))
+    if process.returncode < 0:
+        # TODO: change the error type
+        raise Exception("command died on signal %d" % (-process.returncode,))
+    # process exited with code 0
+    return
 
 # }}}
 #-----------------------------------------------------------------------------
@@ -437,15 +457,17 @@ class _OpSetEnv:
         pass
 
 class _OpRunCommand:
-    def __init__(self, command):
+    def __init__(self, command, env):
         self.command = command
+        self.env = env.copy()
 
     def __str__(self):
         return "run %s" % (" ".join(_quote(c) for c in self.command),)
 
     def plan(self, server, rootdir, plan):
+        # XXX: `self.command' is a list
         plan.entry(
-            action = [_execute, self.command[0], self.command[1:]],
+            action = [_execute, self.command, False, self.env, rootdir],
             log = ["run %s", " ".join(_quote(c) for c in self.command)],
         )
 
@@ -463,8 +485,9 @@ class _OpRunScript:
             return "script\n  %s\nend" % ("\n  ".join(lines),)
 
     def plan(self, server, rootdir, plan):
+        # XXX: `self.command' is a string
         plan.entry(
-            action = [_execute, "/bin/sh", ["-c", self.script]],
+            action = [_execute, self.script, True, self.env, rootdir],
             log = "script (TODO: dump the env vars and the script)",
         )
 
@@ -552,7 +575,7 @@ class Script:
             if val is None:
                 return False
             cmd.append(val)
-        self._ops.append(_OpRunCommand(cmd))
+        self._ops.append(_OpRunCommand(cmd, self._env))
         return True
 
     def script(self, script):
