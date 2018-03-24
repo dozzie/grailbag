@@ -448,6 +448,8 @@ class _OpSetEnv:
         self.value = value
 
     def __str__(self):
+        if self.value is None:
+            return "env %s" % (_quote(self.name),)
         return "env %s %s" % (
             _quote(self.name),
             _quote(self.value),
