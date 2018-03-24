@@ -81,6 +81,7 @@ class _Plan:
         self._paths = set()
         self._plan = []
         self._has_errors = False
+        self._env = {}
 
     def add_path(self, path):
         if path in self._paths:
@@ -92,6 +93,15 @@ class _Plan:
 
     def __contains__(self, path):
         return (path in self._paths)
+
+    def set_env(self, name, value):
+        if value is not None:
+            self._env[name] = value
+        elif name in self._env:
+            del self._env[name]
+
+    def get_env(self):
+        return self._env.copy()
 
     def entry(self, action = None, log = None, error = None):
         def format_msg(s):
@@ -456,12 +466,11 @@ class _OpSetEnv:
         )
 
     def plan(self, server, rootdir, plan):
-        pass
+        plan.set_env(self.name, self.value)
 
 class _OpRunCommand:
-    def __init__(self, command, env):
+    def __init__(self, command):
         self.command = command
-        self.env = env.copy()
 
     def __str__(self):
         return "run %s" % (" ".join(_quote(c) for c in self.command),)
@@ -469,14 +478,13 @@ class _OpRunCommand:
     def plan(self, server, rootdir, plan):
         # XXX: `self.command' is a list
         plan.entry(
-            action = [_execute, self.command, False, self.env, rootdir],
+            action = [_execute, self.command, False, plan.get_env(), rootdir],
             log = ["run %s", " ".join(_quote(c) for c in self.command)],
         )
 
 class _OpRunScript:
-    def __init__(self, script, env):
+    def __init__(self, script):
         self.script = script
-        self.env = env.copy()
 
     def __str__(self):
         # TODO: don't indent empty lines
@@ -489,8 +497,8 @@ class _OpRunScript:
     def plan(self, server, rootdir, plan):
         # XXX: `self.command' is a string
         plan.entry(
-            action = [_execute, self.script, True, self.env, rootdir],
-            log = "script (TODO: dump the env vars and the script)",
+            action = [_execute, self.script, True, plan.get_env(), rootdir],
+            log = "script (TODO: dump the script)",
         )
 
 # }}}
@@ -577,11 +585,11 @@ class Script:
             if val is None:
                 return False
             cmd.append(val)
-        self._ops.append(_OpRunCommand(cmd, self._env))
+        self._ops.append(_OpRunCommand(cmd))
         return True
 
     def script(self, script):
-        self._ops.append(_OpRunScript(script, self._env))
+        self._ops.append(_OpRunScript(script))
         return True
 
     # }}}
