@@ -469,8 +469,8 @@ class _OpSetEnv:
         plan.set_env(self.name, self.value)
 
 class _OpRunCommand:
-    def __init__(self, command):
-        self.command = command
+    def __init__(self, *command):
+        self.command = list(command)
 
     def __str__(self):
         return "run %s" % (" ".join(_quote(c) for c in self.command),)
@@ -585,7 +585,7 @@ class Script:
             if val is None:
                 return False
             cmd.append(val)
-        self._ops.append(_OpRunCommand(cmd))
+        self._ops.append(_OpRunCommand(*cmd))
         return True
 
     def script(self, script):
