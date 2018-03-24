@@ -10,12 +10,37 @@ import errno
 import fnmatch
 import collections
 from artifact import Artifact
-from exceptions import *
+from exceptions import GrailBagException, UnknownArtifact
 
 __all__ = [
+    "ScriptError", "ScriptBuildError", "ScriptParseError", "ScriptRunError",
     "Script",
 ]
 
+#-----------------------------------------------------------------------------
+# exceptions {{{
+
+class ScriptError(Exception):
+    def __init__(self, message, *args):
+        super(ScriptError, self).__init__(message % args)
+
+class ScriptBuildError(ScriptError, ValueError):
+    pass
+
+class ScriptParseError(ScriptError):
+    def __init__(self, message, line = None, column = None, *args):
+        super(ScriptParseError, self).__init__(message % args)
+        self.line = line
+        self.column = column
+
+class ScriptRunError(ScriptError):
+    def __init__(self, message, logs = None, *args):
+        super(ScriptRunError, self).__init__(message % args)
+        # if set, it's a list of tuples (log,error), with `log' and `error'
+        # being a (possibly multiline) string or `None'
+        self.logs = logs
+
+# }}}
 #-----------------------------------------------------------------------------
 # string helper functions {{{
 
@@ -59,8 +84,7 @@ def _format(string, artifact_or_tags, tags, env):
         key = match.group(0)
         if key[0] == "$":
             if key[2:-1] not in env:
-                # TODO: different error type
-                raise ValueError("%s variable not defined" % (key,))
+                raise ScriptBuildError("variable %s not defined", key)
             return env[key[2:-1]]
         return fields[key[2:-1]]
     try:
@@ -116,17 +140,18 @@ class _Plan:
 
         self._plan.append((action, format_msg(log), format_msg(error)))
 
-    def has_errors(self):
-        return self._has_errors
-
     def errors(self):
         for (action, log, error) in self._plan:
             yield (error, log)
 
     def actions(self):
         if self._has_errors:
-            # TODO: change the error type
-            raise Exception("the script has errors")
+            logs = [
+                (log, error)
+                for (action, log, error) in self._plan
+                if log is not None or error is not None
+            ]
+            raise ScriptRunError("the script plan has errors", logs = logs)
 
         for (action, log, error) in self._plan:
             yield (action[0], action[1:], log)
@@ -311,11 +336,9 @@ def _execute(command, shell, env, rootdir):
     )
     process.communicate()
     if process.returncode > 0:
-        # TODO: change the error type
-        raise Exception("command exited with code %d" % (process.returncode,))
+        raise ScriptRunError("command exited with code %d", process.returncode)
     if process.returncode < 0:
-        # TODO: change the error type
-        raise Exception("command died on signal %d" % (-process.returncode,))
+        raise ScriptRunError("command died on signal %d", -process.returncode)
     # process exited with code 0
     return
 
@@ -367,9 +390,23 @@ class _OpGetFile:
                 log = ["make_dir %s", _quote(os.path.dirname(self.path))],
             )
 
+        # TODO: allow no-network plan (file hash checking will be skipped)
+        try:
+            info = server.info(self.id)
+        except UnknownArtifact:
+            plan.entry(
+                error = "artifact not found",
+                log = ["get %s %s", _quote(self.id), _quote(self.path)],
+            )
+            return
+        except GrailBagException, e:
+            plan.entry(
+                error = ["GrailBag error: %s", str(e)],
+                log = ["get %s %s", _quote(self.id), _quote(self.path)],
+            )
+            return
+
         file_hash = _digest(filename)
-        # TODO: plan error on `UnknownArtifact' or `PermissionError'
-        info = server.info(self.id)
         if file_hash is None:
             plan.entry(
                 action = [_delete, filename],
@@ -380,7 +417,7 @@ class _OpGetFile:
         if file_hash != info.digest:
             plan.entry(
                 action = [_OpGetFile.get, server, filename, self.id],
-                log = ["get %s %s", _quote(self.path), _quote(self.id)],
+                log = ["get %s %s", _quote(self.id), _quote(self.path)],
             )
 
 class _OpMakeDirectory:
@@ -465,7 +502,21 @@ class _OpSetEnv:
             _quote(self.value),
         )
 
+    @staticmethod
+    def noop():
+        pass
+
     def plan(self, server, rootdir, plan):
+        if self.value is not None:
+            plan.entry(
+                action = [_OpSetEnv.noop],
+                log = ["%s=%s", _quote(self.name), _quote(self.value)],
+            )
+        else:
+            plan.entry(
+                action = [_OpSetEnv.noop],
+                log = ["unset %s", _quote(self.name)],
+            )
         plan.set_env(self.name, self.value)
 
 class _OpRunCommand:
@@ -496,9 +547,13 @@ class _OpRunScript:
 
     def plan(self, server, rootdir, plan):
         # XXX: `self.command' is a string
+
+        script_log_lines = []
+        for line in self.script.strip("\n").split("\n"):
+            script_log_lines.append(("# " + line).rstrip())
         plan.entry(
             action = [_execute, self.script, True, plan.get_env(), rootdir],
-            log = "script (TODO: dump the script)",
+            log = ["run script:\n%s", "\n".join(script_log_lines)],
         )
 
 # }}}
@@ -575,7 +630,7 @@ class Script:
 
     def env(self, name, format, artifact_or_tags = None, **tags):
         if not _valid_env_name(name):
-            raise ValueError("invalid environment variable name: %s" % (name,))
+            raise ScriptBuildError("invalid environment variable: %s", name)
 
         if format is None:
             if name in self._env:
@@ -636,11 +691,11 @@ class Script:
 
             if operation not in Script._OPS:
                 # TODO: different exception type
-                raise Exception("unrecognized operation %s" % (operation,))
+                raise ScriptParseError("unrecognized operation %s", operation)
             if not Script._OPS[operation]["nargs"](len(args)):
-                raise Exception(
-                    "wrong number of arguments for %s: (got %d)" % \
-                    (operation, len(args))
+                raise ScriptParseError(
+                    "wrong number of arguments for %s: (got %d)",
+                    operation, len(args)
                 )
 
             if operation == "script":
@@ -651,9 +706,9 @@ class Script:
                     try:
                         indent = int(args[0][len("indent="):])
                     except:
-                        raise Exception("invalid script indent value")
+                        raise ScriptParseError("invalid script indent value")
                     if indent < 1:
-                        raise Exception("invalid script indent value")
+                        raise ScriptParseError("invalid script indent value")
                 indent = " " * indent
                 l += 1
                 script_start = l
@@ -663,7 +718,7 @@ class Script:
                     lines[l] = lines[l][len(indent):]
                     l += 1
                 if l == len(lines) or lines[l].strip() != "end":
-                    raise Exception("unterminated script")
+                    raise ScriptParseError("unterminated script")
                 # XXX: now lines[l] is at the "end" keyword
                 args = [ "\n".join(lines[script_start:l]) ]
 
@@ -696,14 +751,14 @@ class Script:
 
             if ord(line[pos]) < 32:
                 # control character (which includes TAB)
-                raise Exception("unexpected control character")
+                raise ScriptParseError("unexpected control character")
 
             if line[pos] != "\\":
                 result.append(line[pos])
             else: # line[pos] == "\\"
                 pos += 1
                 if pos >= len(line):
-                    raise Exception("unterminated double quote")
+                    raise ScriptParseError("unterminated double quote")
 
                 if line[pos] == "n":
                     result.append("\n")
@@ -717,25 +772,25 @@ class Script:
                     result.append("\\")
                 elif line[pos] == "x":
                     if pos + 2 >= len(line):
-                        raise Exception("unterminated double quote")
+                        raise ScriptParseError("unterminated double quote")
                     try:
                         result.append(int(line[(pos + 1):(pos + 3)], 16))
                         pos += 2
                     except:
-                        raise Exception("invalid \\x## sequence")
+                        raise ScriptParseError("invalid \\x## sequence")
                 else:
-                    raise Exception("invalid \\X sequence")
+                    raise ScriptParseError("invalid \\X sequence")
 
             pos += 1
 
-        raise Exception("unterminated double quote")
+        raise ScriptParseError("unterminated double quote")
 
     @staticmethod
     def _parse_unquoted_field(line, pos):
         start = pos
         while pos < len(line) and line[pos] not in Script._SPACES:
             if line[pos] in _QUOTE:
-                raise Exception("unquoted special character")
+                raise ScriptParseError("unquoted special character")
             pos += 1
         # return the last processed character (and the field, of course)
         return (pos - 1, line[start:pos])
@@ -760,7 +815,7 @@ class Script:
             elif line[pos] in _QUOTE:
                 # special or control character, which is an error
                 # FIXME: UTF-8 characters?
-                raise Exception("unquoted special character")
+                raise ScriptParseError("unquoted special character")
             else:
                 # unquoted string
                 (pos, field) = Script._parse_unquoted_field(line, pos)
@@ -773,7 +828,7 @@ class Script:
             # boundary
             spaces = Script._count_spaces(line, pos)
             if spaces == 0 and pos < len(line):
-                raise Exception("no space separator found")
+                raise ScriptParseError("no space separator found")
             pos += spaces
         return result
 
@@ -787,20 +842,6 @@ class Script:
         for op in self._ops:
             op.plan(server, rootdir, plan)
 
-        if plan.has_errors():
-            # FIXME: don't print to STDERR, collect the logs as an array and
-            # raise an exception with those
-            import sys
-            for (error, log) in plan.errors():
-                if log is not None:
-                    sys.stderr.write(log)
-                    sys.stderr.write("\n")
-                if error is not None:
-                    sys.stderr.write(error)
-                    sys.stderr.write("\n")
-                sys.stderr.flush()
-            return
-
         for (fun, args, log) in plan.actions():
             if handle is not None and log is not None:
                 handle.write(log)
@@ -810,12 +851,11 @@ class Script:
                 fun(*args)
 
         if handle is not None:
-            handle.write("## cleanup\n")
+            handle.write("cleanup: removing excessive files\n")
             handle.flush()
 
         # things to check if they were created by this run
         (paths, subtrees) = self._globs.dirtree(rootdir)
-        deleted = set()
         for path in sorted(paths, reverse = True):
             if path in plan:
                 continue
