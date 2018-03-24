@@ -505,6 +505,24 @@ class _OpRunScript:
 #-----------------------------------------------------------------------------
 
 class Script:
+    #-------------------------------------------------------
+    # static fields for script parsing {{{
+
+    _SPACES = {" ", "\t", "\n", "\r"}
+    _OPS = {
+        "wildcard": { "nargs": lambda(n): n == 1, "class": _OpWatch         },
+        "ignore":   { "nargs": lambda(n): n == 1, "class": _OpIgnore        },
+        "file":     { "nargs": lambda(n): n == 2, "class": _OpGetFile       },
+        "dir":      { "nargs": lambda(n): n == 1, "class": _OpMakeDirectory },
+        "symlink":  { "nargs": lambda(n): n == 2, "class": _OpSymlink       },
+        "env":      { "nargs": lambda(n): n in (1, 2), "class": _OpSetEnv   },
+        "run":      { "nargs": lambda(n): n >= 1, "class": _OpRunCommand    },
+        "script":   { "nargs": lambda(n): True,   "class": _OpRunScript     },
+    }
+
+    # }}}
+    #-------------------------------------------------------
+
     def __init__(self, script = None):
         self._globs = GlobMap()
         self._watch = []
@@ -602,7 +620,162 @@ class Script:
         return "\n".join([watch, ops])
 
     def _parse(self):
-        pass # TODO
+        # TODO: change exception types
+        # TODO: report exact error position
+
+        lines = self._script.split("\n")
+        l = 0
+        while l < len(lines):
+            fields = Script._parse_fields(lines[l])
+            if fields is None:
+                l += 1
+                continue
+
+            operation = fields[0]
+            args = fields[1:]
+
+            if operation not in Script._OPS:
+                # TODO: different exception type
+                raise Exception("unrecognized operation %s" % (operation,))
+            if not Script._OPS[operation]["nargs"](len(args)):
+                raise Exception(
+                    "wrong number of arguments for %s: (got %d)" % \
+                    (operation, len(args))
+                )
+
+            if operation == "script":
+                # special parsing
+                if len(args) == 0:
+                    indent = 2
+                elif len(args) == 1 and args[0].startswith("indent="):
+                    try:
+                        indent = int(args[0][len("indent="):])
+                    except:
+                        raise Exception("invalid script indent value")
+                    if indent < 1:
+                        raise Exception("invalid script indent value")
+                indent = " " * indent
+                l += 1
+                script_start = l
+                while l < len(lines) and \
+                      (lines[l] == "" or lines[l].startswith(indent)):
+                    # strip the leading spaces while we're passing here
+                    lines[l] = lines[l][len(indent):]
+                    l += 1
+                if l == len(lines) or lines[l].strip() != "end":
+                    raise Exception("unterminated script")
+                # XXX: now lines[l] is at the "end" keyword
+                args = [ "\n".join(lines[script_start:l]) ]
+
+            node = Script._OPS[operation]["class"](*args)
+            if isinstance(node, _OpWatch):
+                self._watch.append(node)
+                self._globs.add(node.wildcard, include = True)
+            elif isinstance(node, _OpIgnore):
+                self._watch.append(node)
+                self._globs.add(node.wildcard, include = False)
+            else:
+                self._ops.append(node)
+            l += 1
+
+    @staticmethod
+    def _count_spaces(line, pos):
+        count = 0
+        while pos < len(line) and line[pos] in Script._SPACES:
+            count += 1
+            pos += 1
+        return count
+
+    @staticmethod
+    def _parse_quoted_field(line, pos):
+        pos = pos + 1 # skip the initial double quote
+        result = bytearray()
+        while pos < len(line):
+            if line[pos] == '"':
+                return (pos, str(result))
+
+            if ord(line[pos]) < 32:
+                # control character (which includes TAB)
+                raise Exception("unexpected control character")
+
+            if line[pos] != "\\":
+                result.append(line[pos])
+            else: # line[pos] == "\\"
+                pos += 1
+                if pos >= len(line):
+                    raise Exception("unterminated double quote")
+
+                if line[pos] == "n":
+                    result.append("\n")
+                elif line[pos] == "t":
+                    result.append("\t")
+                elif line[pos] == "r":
+                    result.append("\r")
+                elif line[pos] == '"':
+                    result.append('"')
+                elif line[pos] == "\\":
+                    result.append("\\")
+                elif line[pos] == "x":
+                    if pos + 2 >= len(line):
+                        raise Exception("unterminated double quote")
+                    try:
+                        result.append(int(line[(pos + 1):(pos + 3)], 16))
+                        pos += 2
+                    except:
+                        raise Exception("invalid \\x## sequence")
+                else:
+                    raise Exception("invalid \\X sequence")
+
+            pos += 1
+
+        raise Exception("unterminated double quote")
+
+    @staticmethod
+    def _parse_unquoted_field(line, pos):
+        start = pos
+        while pos < len(line) and line[pos] not in Script._SPACES:
+            if line[pos] in _QUOTE:
+                raise Exception("unquoted special character")
+            pos += 1
+        # return the last processed character (and the field, of course)
+        return (pos - 1, line[start:pos])
+
+    @staticmethod
+    def _parse_fields(line):
+        # skip initial whitespaces
+        pos = Script._count_spaces(line, 0)
+        if pos == len(line) or line[pos] == "#":
+            # an empty line or a comment
+            return None
+
+        result = []
+        while pos < len(line):
+            # XXX: line[pos] is a non-space
+
+            if line[pos] == '"':
+                # quoted string
+                # start with a quote character, end with a quote character
+                (pos, field) = Script._parse_quoted_field(line, pos)
+                result.append(field)
+            elif line[pos] in _QUOTE:
+                # special or control character, which is an error
+                # FIXME: UTF-8 characters?
+                raise Exception("unquoted special character")
+            else:
+                # unquoted string
+                (pos, field) = Script._parse_unquoted_field(line, pos)
+                result.append(field)
+
+            # line[pos] was the last processed character
+            pos += 1
+
+            # skip whitespaces, so the next iteration starts at a field
+            # boundary
+            spaces = Script._count_spaces(line, pos)
+            if spaces == 0 and pos < len(line):
+                raise Exception("no space separator found")
+            pos += spaces
+        return result
 
     # }}}
     #-------------------------------------------------------
