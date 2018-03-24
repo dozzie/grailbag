@@ -216,7 +216,8 @@ def op_info(server, artifact_id):
 def op_get(server, artifact_id, filename):
     with server.get(artifact_id) as download:
         ctx = hashlib.sha512()
-        with open(filename, "w") as output:
+        output = open(filename, "w") if filename != "-" else sys.stdout
+        with output:
             for chunk in download.chunks(4096):
                 ctx.update(chunk)
                 output.write(chunk)
@@ -225,7 +226,8 @@ def op_get(server, artifact_id, filename):
             # TODO: react somehow (call `os.unlink(filename)'?)
             print >>sys.stderr, "digest mismatch!"
             return 1
-        print format_artifact_info(download.info)
+        if filename != "-":
+            print format_artifact_info(download.info)
 
 # }}}
 #------------------------------------------------------
